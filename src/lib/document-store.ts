@@ -25,11 +25,16 @@ export async function readDraft(key = 'latest'): Promise<ShotDocument | undefine
   }); } finally { db.close(); }
 }
 export async function writeDraft(document: ShotDocument) {
+  // A capture is served to the editor as an object URL, which stands for nothing after
+  // a reload, so the draft stores no image and the capture record rebuilds it on open.
+  // Cropped and imported images are data URLs and stay self-contained, which is what
+  // keeps this from ever throwing away the only copy of a picture.
+  const draft: ShotDocument = document.imageSrc.startsWith('blob:') ? { ...document, imageSrc: '' } : document;
   const db = await openDrafts();
   try { await new Promise<void>((resolve, reject) => {
     const transaction = db.transaction('drafts', 'readwrite');
-    transaction.objectStore('drafts').put(document, 'latest');
-    if (document.captureId) transaction.objectStore('drafts').put(document, `capture:${document.captureId}`);
+    transaction.objectStore('drafts').put(draft, 'latest');
+    if (document.captureId) transaction.objectStore('drafts').put(draft, `capture:${document.captureId}`);
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error);
     transaction.onabort = () => reject(transaction.error);

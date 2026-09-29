@@ -1,4 +1,4 @@
-import { useRef } from 'react';
+import { useRef, type MouseEvent } from 'react';
 import { Icon, type IconName } from './Icon';
 import { IconButton } from './ui';
 import type { Annotation } from '../lib/editor-types';
@@ -7,7 +7,9 @@ import { layerDisplayName, layerLabel } from '../lib/naming';
 interface LayersPanelProps {
   annotations: Annotation[];
   selectedId: string | null;
+  selectedIds: string[];
   onSelect: (id: string | null) => void;
+  onSelectionChange: (ids: string[]) => void;
   onToggleHidden: (annotation: Annotation) => void;
   onToggleLock: (annotation: Annotation) => void;
   onReorder: (from: string, to: string) => void;
@@ -17,9 +19,11 @@ interface LayersPanelProps {
 }
 
 export default function LayersPanel({
-  annotations, selectedId, onSelect, onToggleHidden, onToggleLock, onReorder, imageSrc, dimensions, toolIcons,
+  annotations, selectedId, selectedIds, onSelect, onSelectionChange, onToggleHidden, onToggleLock, onReorder, imageSrc, dimensions, toolIcons,
 }: LayersPanelProps) {
   const dragged = useRef<string | null>(null);
+  const rangeAnchor = useRef<string | null>(null);
+  const selection = new Set(selectedIds);
   // Figma numbers layers from the top of the stack downwards.
   const counters = new Map<string, number>();
   const rows = [...annotations].reverse().map(annotation => {
@@ -28,11 +32,29 @@ export default function LayersPanel({
     counters.set(base, next);
     return { annotation, name: layerDisplayName(annotation, next), base };
   });
+  function selectLayer(event: MouseEvent<HTMLButtonElement>, id: string) {
+    const mod = event.ctrlKey || event.metaKey;
+    if (event.shiftKey) {
+      const anchor = rows.findIndex(row => row.annotation.id === (rangeAnchor.current ?? selectedId));
+      const target = rows.findIndex(row => row.annotation.id === id);
+      const start = anchor < 0 ? target : anchor;
+      const range = rows.slice(Math.min(start, target), Math.max(start, target) + 1).map(row => row.annotation.id);
+      const next = mod ? [...new Set([...selectedIds, ...range])] : range;
+      // Keep the clicked row primary while the range anchor stays fixed.
+      onSelectionChange([...next.filter(selected => selected !== id), id]);
+      if (!rangeAnchor.current) rangeAnchor.current = selectedId ?? id;
+      return;
+    }
+    rangeAnchor.current = id;
+    if (mod) onSelectionChange(selection.has(id) ? selectedIds.filter(selected => selected !== id) : [...selectedIds, id]);
+    else onSelect(id);
+  }
 
   return (
     <aside data-panel="left" className="flex flex-col min-h-0 shrink-0 w-[var(--left-w)] bg-surface border-r border-line max-[1040px]:hidden">
       <div className="flex items-center justify-between h-[38px] shrink-0 px-1.5 pl-3 border-b border-line-soft">
         <h2 className="text-[12px] font-medium tracking-[-.01em]">Layers</h2>
+        {selectedIds.length > 1 && <span className="px-1.5 py-0.5 rounded bg-accent-soft text-[10px] text-accent-ink" aria-live="polite">{selectedIds.length} selected</span>}
       </div>
 
       <div className="flex-1 overflow-y-auto scrollbar-none py-[5px] px-1" role="list">
@@ -41,7 +63,8 @@ export default function LayersPanel({
             key={annotation.id}
             role="listitem"
             data-testid="layer-row"
-            data-selected={selectedId === annotation.id || undefined}
+            data-selected={selection.has(annotation.id) || undefined}
+            data-hidden={annotation.hidden || undefined}
             className="group relative flex items-center h-7 rounded-control text-ink hover:bg-black/[.04] data-[selected]:bg-accent-soft"
             draggable
             onDragStart={() => { dragged.current = annotation.id; }}
@@ -53,11 +76,11 @@ export default function LayersPanel({
             }}
             onDragEnd={() => { dragged.current = null; }}
           >
-            <button type="button" data-testid="layer-select" className="flex-1 flex items-center gap-2 min-w-0 h-full pl-[7px] pr-1 text-left text-inherit" onClick={() => onSelect(annotation.id)} title={name}>
+            <button type="button" data-testid="layer-select" aria-pressed={selection.has(annotation.id)} className="flex-1 flex items-center gap-2 min-w-0 h-full pl-[7px] pr-1 text-left text-inherit group-data-[hidden]:opacity-50" onClick={event => selectLayer(event, annotation.id)} title={`${name}${annotation.locked ? ' · Locked' : ''}${annotation.hidden ? ' · Hidden' : ''}`}>
               <span className="grid place-items-center w-[15px] text-ink-3 group-data-[selected]:text-accent-ink"><Icon name={toolIcons[annotation.type] || 'rectangle'} size={14} /></span>
               <span className="flex flex-col justify-center min-w-0 text-app leading-[1.25] overflow-hidden whitespace-nowrap text-ellipsis group-data-[selected]:text-accent-ink group-data-[selected]:font-medium">{name}</span>
             </button>
-            <div className="hidden items-center pr-[3px] group-hover:flex group-data-[selected]:flex">
+            <div className={`${annotation.locked || annotation.hidden ? 'flex' : 'hidden'} items-center pr-[3px] group-hover:flex group-data-[selected]:flex`}>
                <IconButton
                 icon={annotation.locked ? 'lock' : 'unlock'}
                 label={annotation.locked ? 'Unlock layer' : 'Lock layer'}
@@ -78,8 +101,8 @@ export default function LayersPanel({
           </div>
         ))}
 
-        <div data-testid="layer-row" data-kind="image" data-selected={selectedId === null || undefined} className="group relative flex items-center h-7 rounded-control text-ink hover:bg-black/[.04] data-[selected]:bg-accent-soft">
-          <button type="button" data-testid="layer-select" className="flex-1 flex items-center gap-2 min-w-0 h-full pl-[7px] pr-1 text-left text-inherit" onClick={() => onSelect(null)}>
+        <div role="listitem" data-testid="layer-row" data-kind="image" data-selected={selectedIds.length === 0 || undefined} className="group relative flex items-center h-7 rounded-control text-ink hover:bg-black/[.04] data-[selected]:bg-accent-soft">
+          <button type="button" data-testid="layer-select" aria-pressed={selectedIds.length === 0} className="flex-1 flex items-center gap-2 min-w-0 h-full pl-[7px] pr-1 text-left text-inherit" onClick={() => { rangeAnchor.current = null; onSelect(null); }}>
             <span className="block w-[18px] h-[18px] rounded-[3px] overflow-hidden bg-surface shrink-0 shadow-[inset_0_0_0_1px_rgba(0,0,0,.12)]"><img className="block w-full h-full object-cover" src={imageSrc} alt="" /></span>
             <span className="flex flex-col justify-center min-w-0 text-app leading-[1.25] overflow-hidden whitespace-nowrap text-ellipsis group-data-[selected]:text-accent-ink group-data-[selected]:font-medium">Screenshot<small className="text-[10px] font-normal text-ink-3 group-data-[selected]:text-accent-ink group-data-[selected]:opacity-70">{dimensions}</small></span>
           </button>
@@ -88,7 +111,7 @@ export default function LayersPanel({
 
       {!annotations.length ? (
         <p className="px-3 pt-2.5 pb-3.5 text-app leading-[1.5] text-ink-3 border-t border-line-soft">Choose a shape tool, then drag on the image to add a layer.</p>
-      ) : null}
+      ) : <p className="px-3 py-2.5 text-[10px] leading-[1.5] text-ink-3 border-t border-line-soft">Shift click to select a range. Ctrl or ⌘ click to add or remove a layer.</p>}
     </aside>
   );
 }

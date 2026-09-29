@@ -118,15 +118,6 @@ export async function deleteCapture(id: string): Promise<void> {
   }
 }
 
-function loadImage(dataUrl: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.onload = () => resolve(img)
-    img.onerror = () => reject(new Error('One of the screenshot images could not be decoded.'))
-    img.src = dataUrl
-  })
-}
-
 /**
  * Chrome refuses a 2D canvas past 32,767 px on a side, and past roughly 48 megapixels
  * it runs the tab out of memory. `MAX_OUTPUT_SIDE` leaves headroom for composition
@@ -142,39 +133,84 @@ export function captureFitScale(width: number, height: number): number {
   return Math.min(1, Math.sqrt(MAX_OUTPUT_PIXELS / (width * height)), MAX_OUTPUT_SIDE / width, MAX_OUTPUT_SIDE / height)
 }
 
-/** Run in the editor document: only decode one tile at a time to bound memory. */
-export async function materializeCapture(record: CaptureRecord): Promise<string> {
-  if (record.dataUrl) return record.dataUrl
-  if (!record.tiles?.length) throw new Error('This screenshot has no image data.')
-  if (record.width < 1 || record.height < 1) throw new Error('This screenshot has no image data.')
+/** A capture opened for editing: where to point an <img> at, and the pixels behind it. */
+export interface MaterializedCapture {
+  /**
+   * An object URL for the composed image. The browser keys its decoded copy on this,
+   * so the canvas and the layer thumbnail share one decode instead of repeating it,
+   * and nothing pays to base64 the PNG. It is meaningless after a reload, which is
+   * why the draft store never keeps it.
+   */
+  src: string;
+  /** The same image, already decoded, so opening a capture never decodes it twice. */
+  image: HTMLImageElement;
+}
+
+const pendingCaptures = new Map<string, Promise<MaterializedCapture>>()
+
+/** Share in-flight loads when startup effects request the same capture together. */
+export function materializeCapture(record: CaptureRecord): Promise<MaterializedCapture> {
+  const existing = pendingCaptures.get(record.id)
+  if (existing) return existing
+  const pending = openCapture(record).finally(() => pendingCaptures.delete(record.id))
+  pendingCaptures.set(record.id, pending)
+  return pending
+}
+
+async function openCapture(record: CaptureRecord): Promise<MaterializedCapture> {
+  const blob = record.dataUrl
+    // A single-tile capture is already one image, so it only has to be decoded.
+    ? await (await fetch(record.dataUrl)).blob()
+    : composeTiles(record);
+  const src = URL.createObjectURL(blob);
+  const image = new Image();
+  image.src = src;
+  try {
+    await image.decode();
+  } catch {
+    URL.revokeObjectURL(src);
+    throw new Error('This screenshot could not be opened.');
+  }
+  return { src, image };
+}
+
+/** Read the browser's PNG dimensions without decoding a tile a second time. */
+function tileSize(dataUrl: string): { width: number; height: number } {
+  if (!dataUrl.startsWith('data:image/png;base64,')) throw new Error('One of the screenshot images could not be decoded.')
+  const header = atob(dataUrl.slice(22, 66))
+  const read = (offset: number) => (((header.charCodeAt(offset) << 24) >>> 0) + (header.charCodeAt(offset + 1) << 16) + (header.charCodeAt(offset + 2) << 8) + header.charCodeAt(offset + 3))
+  const width = read(16)
+  const height = read(20)
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) throw new Error('One of the screenshot images could not be decoded.')
+  return { width, height }
+}
+
+/**
+ * A lossless image container lets the browser draw the original PNG tiles directly.
+ * Flattening to PNG here used to compress the entire page and decode it again before
+ * Studio could show anything. The editor still receives a normal, origin-clean image
+ * and only its eventual copy/export needs to encode a new PNG.
+ */
+function composeTiles(record: CaptureRecord): Blob {
+  if (!record.tiles?.length) throw new Error('This screenshot has no image data.');
+  if (!Number.isFinite(record.width) || !Number.isFinite(record.height) || record.width < 1 || record.height < 1) throw new Error('This screenshot has no image data.');
   // The tiles keep their full resolution, so reducing the composed image costs export
   // detail rather than discarding the capture.
   const scale = captureFitScale(record.width, record.height)
   const width = Math.max(1, Math.floor(record.width * scale))
   const height = Math.max(1, Math.floor(record.height * scale))
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const context = canvas.getContext('2d', { alpha: false })
-  if (!context) throw new Error('Your browser could not create the screenshot canvas.')
-  context.fillStyle = '#ffffff'
-  context.fillRect(0, 0, width, height)
-  try {
-    for (const tile of record.tiles) {
-      const img = await loadImage(tile.dataUrl)
-      // Scale every edge independently, the way the capture loop places tiles, so
-      // neighbours stay flush and no seam opens between them.
-      const x = Math.round(tile.x * scale)
-      const y = Math.round(tile.y * scale)
-      context.drawImage(img, tile.sourceX, tile.sourceY, tile.sourceWidth, tile.sourceHeight, x, y, Math.max(1, Math.round((tile.x + tile.width) * scale) - x), Math.max(1, Math.round((tile.y + tile.height) * scale) - y))
-      img.src = ''
-    }
-    const dataUrl = canvas.toDataURL('image/png')
-    if (dataUrl === 'data:,') throw new Error('The browser could not render a screenshot this large.')
-    return dataUrl
-  } finally {
-    // Release the large backing surface as soon as the combined image is encoded.
-    canvas.width = 1
-    canvas.height = 1
+  const parts = [`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="white"/>`]
+  for (const tile of record.tiles) {
+    const dimensions = tileSize(tile.dataUrl)
+    const x = Math.round(tile.x * scale)
+    const y = Math.round(tile.y * scale)
+    const tileWidth = Math.max(1, Math.round((tile.x + tile.width) * scale) - x)
+    const tileHeight = Math.max(1, Math.round((tile.y + tile.height) * scale) - y)
+    // The viewport crops area captures and overlapping browser-edge tiles before
+    // placing them. Rounding destination edges keeps neighbouring tiles flush.
+    const dataUrl = tile.dataUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')
+    parts.push(`<svg x="${x}" y="${y}" width="${tileWidth}" height="${tileHeight}" viewBox="${tile.sourceX} ${tile.sourceY} ${tile.sourceWidth} ${tile.sourceHeight}" preserveAspectRatio="none" overflow="hidden"><image width="${dimensions.width}" height="${dimensions.height}" href="${dataUrl}"/></svg>`)
   }
+  parts.push('</svg>')
+  return new Blob(parts, { type: 'image/svg+xml' })
 }

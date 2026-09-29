@@ -66,6 +66,18 @@ async function drag(page, from, to) {
   await page.mouse.up();
 }
 
+/** The same drag with Shift held down the whole way, which is what locks an axis. */
+async function shiftDrag(page, from, to) {
+  const start = await imagePoint(page, ...from);
+  const end = await imagePoint(page, ...to);
+  await page.keyboard.down('Shift');
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(end.x, end.y, { steps: 12 });
+  await page.mouse.up();
+  await page.keyboard.up('Shift');
+}
+
 async function selection(page) {
   return page.locator('[data-testid="editor-artboard"] svg > g > rect').first().evaluate(element => ({ x: +element.getAttribute('x'), y: +element.getAttribute('y'), width: +element.getAttribute('width'), height: +element.getAttribute('height') }));
 }
@@ -101,6 +113,126 @@ async function probe(page, points) {
  */
 const distance = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
 const INK = 30;
+
+/** The highlighter's recorded path, read back from the saved document. */
+async function pointsOf(page) {
+  // The draft write is debounced, so the path has to be allowed to land.
+  await page.waitForTimeout(900);
+  return page.evaluate(async () => {
+    const db = await new Promise((ok, fail) => { const r = indexedDB.open('imageshot-studio', 1); r.onupgradeneeded = () => r.result.createObjectStore('drafts'); r.onsuccess = () => ok(r.result); r.onerror = () => fail(r.error); });
+    const draft = await new Promise((ok, fail) => { const r = db.transaction('drafts').objectStore('drafts').get('latest'); r.onsuccess = () => ok(r.result); r.onerror = () => fail(r.error); });
+    db.close();
+    const highlight = draft?.annotations?.find(a => a.type === 'highlight');
+    if (!highlight) throw new Error('no highlight was saved');
+    return (highlight.points || []).map(p => ({ x: p.x + highlight.x, y: p.y + highlight.y }));
+  });
+}
+
+test('the highlighter is a marker that follows the path, not a box', async () => {
+  const page = await editor();
+  try {
+    await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+    // A swipe that drifts: the mark has to follow it, so the box it occupies is only
+    // the bounds of the path and not a rectangle the hand happened to describe.
+    await drag(page, [180, 220], [620, 300]);
+    await frames(page);
+    const bounds = await selection(page);
+    // The mark is fat, so the box carries half its width on every side.
+    assert.ok(bounds.height > 80, `the marker is wider than the path, got ${bounds.height}`);
+    assert.ok(bounds.width > 400, `the mark follows the full length, got ${bounds.width}`);
+
+    // A second mark is a separate layer, not a merge.
+    await page.getByRole('button', { name: 'Select (V)', exact: true }).click();
+    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Highlight 1' }).count(), 1);
+  } finally { await page.close(); }
+});
+
+test('Shift straightens the highlighter segment to a row, a column or 45 degrees', async () => {
+  const page = await editor();
+  try {
+    await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+
+    // Held for the whole swipe, a drifting drag has to land as one flat row.
+    await shiftDrag(page, [180, 240], [640, 300]);
+    await frames(page);
+    // A mark one pixel off the row would still read as a row, so the recorded path
+    // itself is checked: every point of a straightened mark shares the same y.
+    const rowPoints = await pointsOf(page);
+    assert.ok(rowPoints.length > 1, 'the mark records a path');
+    assert.ok(rowPoints.every(p => Math.abs(p.y - rowPoints[0].y) < 0.01), `a Shift swipe must be flat, got ys ${JSON.stringify(rowPoints.map(p => Math.round(p.y)))}`);
+
+    // A swipe held down the other way round locks to a column.
+    await page.keyboard.press('Control+z');
+    await shiftDrag(page, [300, 150], [340, 560]);
+    await frames(page);
+    const columnPoints = await pointsOf(page);
+    assert.ok(columnPoints.every(p => Math.abs(p.x - columnPoints[0].x) < 0.01), `a Shift swipe must be flat, got xs ${JSON.stringify(columnPoints.map(p => Math.round(p.x)))}`);
+
+    // Without Shift the same drag keeps the drift, which is what proves the lock did it.
+    await page.keyboard.press('Control+z');
+    await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+    await drag(page, [180, 300], [640, 380]);
+    await frames(page);
+    const free = await pointsOf(page);
+    assert.ok(new Set(free.map(p => Math.round(p.y))).size > 1, 'a free swipe keeps the hand angle');
+
+    // A diagonal drag holds to the 45 degree line, not to the nearest axis.
+    await page.keyboard.press('Control+z');
+    await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+    await shiftDrag(page, [160, 160], [520, 440]);
+    await frames(page);
+    const diagonal = await pointsOf(page);
+    const [origin] = diagonal;
+    assert.ok(diagonal.length > 1, 'the mark records a path');
+    assert.ok(diagonal.every(p => Math.abs(Math.abs(p.x - origin.x) - Math.abs(p.y - origin.y)) < 0.01), `a Shift diagonal must hold 45 degrees, got ${JSON.stringify(diagonal.map(p => [Math.round(p.x - origin.x), Math.round(p.y - origin.y)]))}`);
+  } finally { await page.close(); }
+});
+
+test('the highlighter size control changes how thick the mark is drawn', async () => {
+  const page = await editor();
+  try {
+    await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+    await drag(page, [200, 260], [600, 300]);
+    await frames(page);
+    const thin = await selection(page);
+    assert.equal(await page.getByLabel('Highlighter size').inputValue(), '16', 'a fresh mark is 16px');
+
+    await page.getByLabel('Highlighter size').fill('48');
+    await page.getByLabel('Highlighter size').press('Enter');
+    await page.waitForTimeout(150);
+    assert.equal(await page.getByLabel('Highlighter size').inputValue(), '48');
+    const thick = await selection(page);
+    // Half the mark's width sits outside the path on each side, so a 16px to 48px mark
+    // adds 32px to the box in total.
+    assert.ok(thick.height - thin.height > 25 && thick.height - thin.height < 40, `the mark must get fatter, went ${thin.height} to ${thick.height}`);
+  } finally { await page.close(); }
+});
+
+test('a highlight can be picked, moved and deleted like any other layer', async () => {
+  const page = await editor();
+  try {
+    await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+    await drag(page, [200, 300], [520, 340]);
+    await frames(page);
+    const before = await selection(page);
+
+    // Reached by clicking the mark itself, which only works because it is picked along
+    // its body rather than anywhere in its bounding box.
+    await page.getByRole('button', { name: 'Select (V)', exact: true }).click();
+    const onMark = await imagePoint(page, 360, 320);
+    await page.mouse.click(onMark.x, onMark.y);
+    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Highlight 1' }).count(), 1, 'clicking the mark itself selects it');
+
+    await drag(page, [360, 320], [440, 420]);
+    await frames(page);
+    const moved = await selection(page);
+    assert.ok(Math.abs(moved.x - before.x) > 40, `the mark must move, went from ${before.x} to ${moved.x}`);
+
+    await page.keyboard.press('Delete');
+    await frames(page);
+    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Highlight 1' }).count(), 0);
+  } finally { await page.close(); }
+});
 
 test('arrow bodies bend three ways and the bend handle drags the curve', async () => {
   const page = await editor();
@@ -535,5 +667,103 @@ test('text typography controls reshape the box and never rescale the font size',
     assert.equal(await shown(page, 'Text size'), '32');
     assert.ok(Math.abs(geist.height - before.height) < 1, 'the line count cannot change with the family');
     assert.ok(Math.abs(geist.width - before.width) / before.width < 0.15, 'two sans faces stay close in width');
+  } finally { await page.close(); }
+});
+
+/**
+ * Writes a capture straight into the extension's own store, the way the background
+ * worker does, so the editor's real load path is what gets exercised.
+ */
+async function seedCapture(page, record) {
+  await page.evaluate(async (capture) => {
+    await new Promise((done, fail) => {
+      const request = indexedDB.open('imageshot-local', 1);
+      request.onupgradeneeded = () => {
+        const store = request.result.createObjectStore('captures', { keyPath: 'id' });
+        store.createIndex('createdAt', 'createdAt');
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const transaction = db.transaction('captures', 'readwrite');
+        transaction.objectStore('captures').put(capture);
+        transaction.oncomplete = () => { db.close(); done(); };
+        transaction.onerror = () => fail(transaction.error);
+      };
+      request.onerror = () => fail(request.error);
+    });
+  }, record);
+  return record;
+}
+
+/** A solid PNG of the given size, as a capture would be stored. */
+async function solidPng(page, width, height, colour) {
+  return page.evaluate(async ({ w, h, rgb }) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const context = canvas.getContext('2d');
+    context.fillStyle = `rgb(${rgb})`;
+    context.fillRect(0, 0, w, h);
+    const blob = await new Promise(done => canvas.toBlob(done, 'image/png'));
+    return await new Promise(done => { const reader = new FileReader(); reader.onload = () => done(reader.result); reader.readAsDataURL(blob); });
+  }, { w: width, h: height, rgb: colour });
+}
+
+/** The pixel size the layers panel reports for the loaded image. */
+function imageDimensions(page) {
+  return page.locator('[data-testid="layer-row"][data-kind="image"] small');
+}
+
+/** Reads a saved draft straight out of IndexedDB, which is what the editor wrote. */
+function draftImageSrc(page, key) {
+  return page.evaluate(async (draftKey) => {
+    const db = await new Promise((ok, fail) => {
+      const request = indexedDB.open('imageshot-studio', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('drafts');
+      request.onsuccess = () => ok(request.result);
+      request.onerror = () => fail(request.error);
+    });
+    const draft = await new Promise((ok, fail) => {
+      const request = db.transaction('drafts').objectStore('drafts').get(draftKey);
+      request.onsuccess = () => ok(request.result);
+      request.onerror = () => fail(request.error);
+    });
+    db.close();
+    return draft?.imageSrc;
+  }, key);
+}
+
+test('a capture opens at its own size, and reopening it keeps the work on it', async () => {
+  const page = await editor();
+  try {
+    const dataUrl = await solidPng(page, 900, 620, 'rgb(64, 132, 214)');
+    const capture = await seedCapture(page, { id: 'editor-load-1', name: 'Quarterly review', sourceUrl: 'https://example.test/report', createdAt: Date.now(), mode: 'visible', width: 900, height: 620, dataUrl });
+
+    // The editor paints the sample workspace first and swaps in the capture once it
+    // has been read, so the reported size is what tells the two apart.
+    await page.goto(`${url}/editor.html?capture=${capture.id}`);
+    await imageDimensions(page).filter({ hasText: '900 × 620' }).waitFor();
+
+    // Annotate, wait for the debounced draft, then reopen. The capture is served from
+    // an object URL, so the draft holds no image and it is rebuilt from the record.
+    await page.getByRole('button', { name: 'Line (A)', exact: true }).click();
+    await drag(page, [200, 200], [520, 200]);
+    await frames(page);
+    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Line 1' }).count(), 1);
+    await page.waitForTimeout(1200);
+    assert.equal(await draftImageSrc(page, `capture:${capture.id}`), '', 'a composed capture must not be written into the draft as an image');
+
+    await page.goto(`${url}/editor.html?capture=${capture.id}`);
+    await imageDimensions(page).filter({ hasText: '900 × 620' }).waitFor();
+    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Line 1' }).count(), 1, 'the rebuilt capture must keep the layers saved with it');
+  } finally { await page.close(); }
+});
+
+test('a capture that is gone reports it instead of opening a blank artboard', async () => {
+  const page = await editor();
+  try {
+    await page.goto(`${url}/editor.html?capture=never-captured`);
+    await page.getByRole('status').filter({ hasText: 'no longer available' }).waitFor();
+    assert.equal(await page.getByRole('status').filter({ hasText: 'no longer available' }).count(), 1);
   } finally { await page.close(); }
 });

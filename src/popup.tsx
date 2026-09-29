@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { Brand, Icon, type IconName } from './components/Icon';
 import { Segmented } from './components/ui';
 import type { CaptureMode } from './lib/capture-store';
+import { readCaptureDestination, writeCaptureDestination, type CaptureDestination } from './extension/preferences';
 import './styles.css';
 
 /** One word fits a stacked toolbar; the full name stays the accessible label. */
@@ -16,16 +17,18 @@ const NAMES: Record<CaptureMode, string> = { visible: 'Visible page', full: 'Ful
 function Popup() {
   const [busy, setBusy] = useState<CaptureMode | null>(null);
   const [error, setError] = useState('');
+  const [destination, setDestination] = useState<CaptureDestination | null>(null);
   const extension = typeof chrome !== 'undefined' && Boolean(chrome.runtime?.id);
+  useEffect(() => { void readCaptureDestination().then(setDestination); }, []);
   async function capture(mode: CaptureMode) {
     if (!extension) { setError('Load the dist folder as an unpacked extension in Chrome or Edge to capture a webpage. You can try the editor below.'); return; }
     setError(''); setBusy(mode);
     let closeTimer: ReturnType<typeof window.setTimeout> | undefined;
     try {
       const promise = chrome.runtime.sendMessage({ type: 'IMAGESHOT_CAPTURE', mode });
-      // These two take over the page, so the popup steps aside straight away rather
-      // than sitting on top of the thing being captured.
-      if (mode === 'area' || mode === 'full') { closeTimer = window.setTimeout(() => window.close(), 150); }
+      // The capture takes over the page and reports back on the page itself, so the
+      // popup steps aside rather than sitting on top of the thing being captured.
+      closeTimer = window.setTimeout(() => window.close(), 150);
       const result = await promise;
       if (!result?.ok) setError(result?.error || 'Capture could not finish. Try again on a regular webpage.');
       else window.close();
@@ -35,6 +38,10 @@ function Popup() {
   function openEditor() {
     if (extension) chrome.tabs.create({ url: chrome.runtime.getURL('editor.html') });
     else window.open('./editor.html', '_blank');
+  }
+  function chooseDestination(next: CaptureDestination) {
+    setDestination(next);
+    void writeCaptureDestination(next);
   }
   const current = MODES.find(m => m.id === busy);
   return <div className="w-[336px] overflow-hidden bg-surface text-app">
@@ -59,6 +66,27 @@ function Popup() {
       <p className="flex items-center justify-center h-[15px] px-1 text-[10.5px] leading-none text-center text-ink-2 whitespace-nowrap" role="status" aria-live="polite">
         {current ? `Capturing ${current.text}` : 'Visible, full page, or a region you drag out'}
       </p>
+
+      {destination && extension && (
+        <div className="flex items-start gap-2.5 -mx-0.5 px-1 py-1.5" role="group" aria-label="After a capture">
+          <input
+            type="checkbox"
+            id="quick-copy"
+            className="mt-[1px] w-[13px] h-[13px] accent-[#6244e0] shrink-0 cursor-pointer"
+            checked={destination === 'panel'}
+            disabled={!!busy}
+            onChange={event => chooseDestination(event.target.checked ? 'panel' : 'studio')}
+          />
+          <label htmlFor="quick-copy" className="flex flex-col gap-[2px] min-w-0 cursor-pointer select-none">
+            <span className="text-[11.5px] font-medium leading-none text-ink">Copy without leaving the page</span>
+            <span className="text-[10px] leading-[1.5] text-ink-2">
+              {destination === 'panel'
+                ? 'Your screenshot appears on the page with a copy button.'
+                : 'Your screenshot opens straight in the Studio.'}
+            </span>
+          </label>
+        </div>
+      )}
 
       <button
         type="button"

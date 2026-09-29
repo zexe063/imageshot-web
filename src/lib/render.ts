@@ -1,5 +1,6 @@
 import type { Annotation, ArrowStyle, CompositionSize, CompositionStyle, Point } from './editor-types';
 import { DEFAULT_STYLE } from './editor-types';
+import { smoothStroke, traceStroke } from './stroke';
 
 /** Height of the fake browser chrome drawn above the screenshot. */
 export const FRAME_HEADER = 40;
@@ -173,7 +174,9 @@ export function arrowCurveAt(annotation: Annotation, point: Point): number {
     const away = { x: -first.x + second.x, y: -first.y + second.y };
     const scale = Math.SQRT1_2;
     const moved = (point.x - corner.x) * away.x * scale + (point.y - corner.y) * away.y * scale;
-    return clamp(moved / limit, 0, 1);
+    // The arc midpoint is (1 - 1/sqrt(2)) radii off each leg, so its distance
+    // along the bisector is radius * (sqrt(2) - 1).
+    return clamp(moved / (limit * (Math.SQRT2 - 1)), 0, 1);
   }
   // Signed distance off the chord, so the handle picks up whichever side it is on.
   const signed = ((point.x - (tail.x + tip.x) / 2) * -dy + (point.y - (tail.y + tip.y) / 2) * dx) / length;
@@ -182,8 +185,19 @@ export function arrowCurveAt(annotation: Annotation, point: Point): number {
 
 /** Where the bend handle sits: the body's own midpoint, bowed or cornered. */
 export function arrowBendPoint(annotation: Annotation): Point {
-  const path = arrowGeometry(annotation).path;
-  return path[Math.floor(path.length / 2)];
+  const geometry = arrowGeometry(annotation);
+  if (geometry.kind === 'curved' && geometry.control) {
+    return { x: (geometry.tail.x + 2 * geometry.control.x + geometry.tip.x) / 4,
+      y: (geometry.tail.y + 2 * geometry.control.y + geometry.tip.y) / 4 };
+  }
+  if (geometry.kind === 'elbow' && geometry.corner) {
+    if (geometry.centre && geometry.radius > 0) {
+      return { x: geometry.centre.x + (geometry.corner.x - geometry.centre.x) * Math.SQRT1_2,
+        y: geometry.centre.y + (geometry.corner.y - geometry.centre.y) * Math.SQRT1_2 };
+    }
+    return geometry.corner;
+  }
+  return { x: (geometry.tail.x + geometry.tip.x) / 2, y: (geometry.tail.y + geometry.tip.y) / 2 };
 }
 
 /** Head length, following the stroke weight unless the layer set its own. */
@@ -197,7 +211,7 @@ export function arrowHeadSize(annotation: Annotation, length: number): number {
 export const TEXT_FAMILIES = ['Inter', 'Geist'] as const;
 export type TextFamily = (typeof TEXT_FAMILIES)[number];
 const TEXT_STACKS: Record<TextFamily, string> = {
-  Inter: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+  Inter: '"Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   Geist: '"Geist Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
 };
 const TEXT_WEIGHTS = [400, 500, 600, 700] as const;
@@ -295,11 +309,50 @@ export function roundedPath(ctx: CanvasRenderingContext2D, x: number, y: number,
   ctx.closePath();
 }
 
+/**
+ * The width of a highlighter mark. The layer's stroke weight drives it, the same way a
+ * pixelate layer's strength does, but a marker is fat and a pen is not, so the shared
+ * weight is scaled up and never falls below something you could see.
+ */
+export function markerWidthFromWeight(weight: number | undefined): number {
+  return Math.max(8, styleNumber(weight, 4) * 4);
+}
+
+export function markerWidth(annotation: Annotation): number {
+  return markerWidthFromWeight(annotation.strokeWidth);
+}
+
+/** Absolute samples of the same smoothed path used by the renderer, for picking. */
+export function strokePath(annotation: Annotation): Point[] {
+  if (!annotation.points?.length) return [];
+  return smoothStroke(annotation.points).path.map(point => ({ x: annotation.x + point.x, y: annotation.y + point.y }));
+}
+
 export function annotationBounds(annotation: Annotation) {
   if (annotation.type === 'text') {
     // The box always hugs the text. Dragging a text layer scales the type instead of
     // stretching a frame, so there is no stored width to honour here.
     return { x: annotation.x, y: annotation.y, ...textFrame(annotation) };
+  }
+  if ((annotation.type === 'highlight' || annotation.type === 'pen') && annotation.points?.length) {
+    const geometry = smoothStroke(annotation.points);
+    const reach = (annotation.type === 'highlight' ? markerWidth(annotation) : Math.max(1, styleNumber(annotation.strokeWidth, 1))) / 2;
+    let left = geometry.bounds.x - reach, top = geometry.bounds.y - reach;
+    let right = geometry.bounds.x + geometry.bounds.width + reach, bottom = geometry.bounds.y + geometry.bounds.height + reach;
+    if (annotation.type === 'highlight' && geometry.path.length > 1) {
+      // A diagonal square cap can extend further than the stroke radius on an axis.
+      const first = geometry.segments[0], last = geometry.segments[geometry.segments.length - 1];
+      const ends = [[geometry.start, first.control || first.to], [last.to, last.control || last.from]];
+      for (const [point, next] of ends) {
+        const dx = point.x - next.x, dy = point.y - next.y;
+        const distance = Math.hypot(dx, dy) || 1;
+        const capX = point.x + reach * dx / distance, capY = point.y + reach * dy / distance;
+        const extentX = Math.abs(reach * dy / distance), extentY = Math.abs(reach * dx / distance);
+        left = Math.min(left, capX - extentX); right = Math.max(right, capX + extentX);
+        top = Math.min(top, capY - extentY); bottom = Math.max(bottom, capY + extentY);
+      }
+    }
+    return { x: annotation.x + left, y: annotation.y + top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
   }
   return {
     x: Math.min(annotation.x, annotation.x + annotation.width),
@@ -395,10 +448,8 @@ export function drawAnnotation(ctx: CanvasRenderingContext2D, annotation: Annota
     case 'pen': {
       const points = a.points || [];
       if (!points.length) break;
-      ctx.beginPath();
-      ctx.moveTo(a.x + points[0].x, a.y + points[0].y);
-      if (points.length === 1) ctx.lineTo(a.x + points[0].x + 0.1, a.y + points[0].y);
-      for (let i = 1; i < points.length; i++) ctx.lineTo(a.x + points[i].x, a.y + points[i].y);
+      traceStroke(ctx, points, a.x, a.y);
+      if (smoothStroke(points).path.length === 1) ctx.lineTo(a.x + points[0].x + 0.01, a.y + points[0].y);
       ctx.stroke();
       break;
     }
@@ -419,10 +470,29 @@ export function drawAnnotation(ctx: CanvasRenderingContext2D, annotation: Annota
       });
       break;
     }
-    case 'highlight':
-      ctx.globalAlpha *= 0.3;
-      ctx.fillRect(box.x, box.y, box.width, box.height);
+    case 'highlight': {
+      const points = a.points || [];
+      // Multiply keeps dark screenshot text crisp. A single stroke composites once,
+      // so slowing down, retracing or crossing a mark never creates darker patches.
+      ctx.globalCompositeOperation = 'multiply';
+      ctx.globalAlpha *= 0.35;
+      if (!points.length) {
+        // A highlight saved before it became a marker is a plain box. Keep drawing it
+        // the old way rather than dropping someone's saved work.
+        ctx.fillRect(box.x, box.y, box.width, box.height);
+        break;
+      }
+      ctx.lineWidth = markerWidth(a);
+      ctx.lineCap = 'square';
+      if (smoothStroke(points).path.length === 1) {
+        const reach = ctx.lineWidth / 2;
+        ctx.fillRect(a.x + points[0].x - reach, a.y + points[0].y - reach, ctx.lineWidth, ctx.lineWidth);
+        break;
+      }
+      traceStroke(ctx, points, a.x, a.y);
+      ctx.stroke();
       break;
+    }
     case 'blur': {
       ctx.shadowColor = 'transparent';
       ctx.shadowBlur = 0;
@@ -538,6 +608,17 @@ function frameBaseColor(background: string) {
   return solidFrom(background) || '#ffffff';
 }
 
+interface PreviewBackground {
+  image: HTMLImageElement;
+  source: string;
+  key: string;
+  canvas: HTMLCanvasElement;
+}
+
+// Only live previews cache their stable screenshot. Export canvases stay one-shot;
+// very large captures skip the extra bitmap to keep their memory bounded.
+const previewBackgrounds = new WeakMap<HTMLCanvasElement, PreviewBackground>();
+const MAX_CACHED_PREVIEW_PIXELS = 16_000_000;
 
 /** Renders padding, background, corner radius, frame and stroke around the original pixels. */
 export function renderComposition(image: HTMLImageElement, annotations: Annotation[], style: CompositionStyle, scale = 1, target?: HTMLCanvasElement): HTMLCanvasElement {
@@ -559,7 +640,6 @@ export function renderComposition(image: HTMLImageElement, annotations: Annotati
   if (!ctx) throw new Error('Your browser could not create a screenshot canvas.');
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.scale(ratio, ratio);
   if (!size.imageWidth || !size.imageHeight) return canvas;
 
   const stroke = clamp(styleNumber(style.strokeWidth), 0, 200);
@@ -568,21 +648,47 @@ export function renderComposition(image: HTMLImageElement, annotations: Annotati
   const radius = clamp(styleNumber(style.radius), 0, Math.min(plate.width, plate.height) / 2);
   const background = style.background || 'transparent';
 
-  if (background !== 'transparent') {
-    ctx.save();
-    roundedPath(ctx, plate.x, plate.y, plate.width, plate.height, radius);
-    ctx.fillStyle = paintFill(ctx, background, plate) || 'transparent';
-    ctx.fill();
-    ctx.restore();
-  }
+  const paintBackground = (context: CanvasRenderingContext2D) => {
+    if (background !== 'transparent') {
+      context.save();
+      roundedPath(context, plate.x, plate.y, plate.width, plate.height, radius);
+      context.fillStyle = paintFill(context, background, plate) || 'transparent';
+      context.fill();
+      context.restore();
+    }
+    if (header) drawFrameHeader(context, plate.x, plate.y, plate.width, header, radius, frameBaseColor(background));
+    context.save();
+    roundedPath(context, size.imageX, size.imageY, size.imageWidth, size.imageHeight, radius);
+    context.clip();
+    context.drawImage(image, size.imageX, size.imageY, size.imageWidth, size.imageHeight);
+    context.restore();
+  };
 
-  if (header) drawFrameHeader(ctx, plate.x, plate.y, plate.width, header, radius, frameBaseColor(background));
+  let cached: PreviewBackground | undefined;
+  if (target && width * height <= MAX_CACHED_PREVIEW_PIXELS) {
+    const source = image.currentSrc || image.src;
+    const key = JSON.stringify([width, height, ratio, size, background, stroke, header, radius]);
+    cached = previewBackgrounds.get(target);
+    if (!cached || cached.image !== image || cached.source !== source || cached.key !== key) {
+      const bitmap = cached?.canvas || document.createElement('canvas');
+      bitmap.width = width; bitmap.height = height;
+      const bitmapContext = bitmap.getContext('2d');
+      if (bitmapContext) {
+        bitmapContext.scale(ratio, ratio);
+        paintBackground(bitmapContext);
+        cached = { image, source, key, canvas: bitmap };
+        previewBackgrounds.set(target, cached);
+      } else cached = undefined;
+    }
+  } else if (target) previewBackgrounds.delete(target);
+  if (cached) ctx.drawImage(cached.canvas, 0, 0);
+  ctx.scale(ratio, ratio);
+  if (!cached) paintBackground(ctx);
 
   ctx.save();
   roundedPath(ctx, size.imageX, size.imageY, size.imageWidth, size.imageHeight, radius);
   ctx.clip();
   ctx.translate(size.imageX, size.imageY);
-  ctx.drawImage(image, 0, 0, size.imageWidth, size.imageHeight);
   for (const annotation of annotations) drawAnnotation(ctx, annotation, image);
   ctx.restore();
 

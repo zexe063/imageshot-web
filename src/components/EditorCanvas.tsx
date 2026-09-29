@@ -1,519 +1,346 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import type { Annotation, ArrowDefaults, CompositionStyle, Point, Tool } from '../lib/editor-types';
-import { annotationBounds, arrowBendPoint, arrowCurveAt, arrowGeometry, getCompositionSize, renderComposition, textFrame, textMetrics, textStack } from '../lib/render';
+import { annotationBounds, arrowBendPoint, arrowCurveAt, arrowGeometry, getCompositionSize, markerWidth, renderComposition, strokePath, textFrame } from '../lib/render';
+import { distanceToLine, resizeBox, selectionBounds, transformAnnotation } from '../lib/selection';
+import type { Box, Handle } from '../lib/selection';
+import InlineTextEditor from './InlineTextEditor';
 
 export interface EditorCanvasProps {
   image: HTMLImageElement | null;
   annotations: Annotation[];
   onChange: (annotations: Annotation[]) => void;
   selectedId: string | null;
+  selectedIds?: string[];
   onSelect: (id: string | null) => void;
+  onSelectionChange?: (ids: string[]) => void;
   tool: Tool;
   color: string;
   strokeWidth: number;
-  /** The arrow body, bend and head a newly drawn arrow starts with. */
   arrow: ArrowDefaults;
+  onArrowChange?: (patch: Partial<Annotation>) => void;
   textSize: number;
+  textStyle?: Partial<Annotation>;
   style: CompositionStyle;
-  /** 1 is fit; other values multiply the fitted scale. */
   zoom: number;
   onToolChange?: (tool: Tool) => void;
   onCrop?: (dataUrl: string, annotations: Annotation[]) => void;
   onStatus?: (message: string) => void;
-  /** Actual display scale relative to original screenshot pixels. */
+  loadingMessage?: string;
   onZoomChange?: (actualZoom: number) => void;
 }
-
-type Handle = 'nw' | 'ne' | 'sw' | 'se';
 interface Gesture {
-  mode: 'draw' | 'move' | 'resize' | 'bend' | 'crop';
-  start: Point;
-  base?: Annotation;
-  handle?: Handle;
-  points?: Point[];
+  mode: 'draw' | 'move' | 'resize' | 'bend' | 'endpoint' | 'crop' | 'marquee';
+  pointerId: number; start: Point; rect: DOMRect; scale: number;
+  base: Annotation[]; bounds?: Box; handle?: Handle; endpoint?: 'tail' | 'tip';
+  points?: Point[]; anchor?: Point; snapped?: boolean;
+  initialSelection: string[]; freehand?: boolean; moved?: boolean;
 }
-interface TextEditor {
-  annotation: Annotation;
-  value: string;
-  isNew: boolean;
-}
-
+interface TextEditor { annotation: Annotation; value: string; isNew: boolean }
+interface Guide { from: Point; to: Point }
 const ACCENT = '#6244e0';
-/** Breathing room around the artboard, and room kept free for a scrollbar. */
 const CANVAS_INSET = 48;
-const SCROLLBAR_ROOM = 17;
 
-function distanceToLine(point: Point, start: Point, end: Point) {
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-  const lengthSquared = dx * dx + dy * dy;
-  const t = lengthSquared ? Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared)) : 0;
-  return Math.hypot(point.x - start.x - t * dx, point.y - start.y - t * dy);
+function contains(a: Annotation, point: Point, tolerance: number) {
+  if (a.hidden || a.locked) return false;
+  if (a.type === 'arrow' || (a.points?.length && ['pen', 'highlight'].includes(a.type))) {
+    const path = a.type === 'arrow' ? arrowGeometry(a).path : strokePath(a);
+    const reach = Math.max(tolerance, a.type === 'highlight' ? markerWidth(a) / 2 : a.strokeWidth / 2);
+    return path.some((p, i) => distanceToLine(point, path[Math.max(0, i - 1)], p) <= reach);
+  }
+  const b = annotationBounds(a);
+  if (a.type === 'ellipse') return ((point.x - b.x - b.width / 2) / (b.width / 2 + tolerance)) ** 2 + ((point.y - b.y - b.height / 2) / (b.height / 2 + tolerance)) ** 2 <= 1;
+  return point.x >= b.x - tolerance && point.x <= b.x + b.width + tolerance && point.y >= b.y - tolerance && point.y <= b.y + b.height + tolerance;
+}
+function tracedAnnotation(base: Annotation, points: Point[]): Annotation {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of points) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); }
+  return { ...base, x: minX, y: minY, width: maxX - minX, height: maxY - minY, points: points.map(p => ({ x: p.x - minX, y: p.y - minY })) };
+}
+function snapAngle(start: Point, point: Point): Point {
+  const angle = Math.round(Math.atan2(point.y - start.y, point.x - start.x) / (Math.PI / 4)) * Math.PI / 4;
+  const length = Math.hypot(point.x - start.x, point.y - start.y);
+  return { x: start.x + Math.cos(angle) * length, y: start.y + Math.sin(angle) * length };
 }
 
-function contains(annotation: Annotation, point: Point, tolerance: number) {
-  if (annotation.hidden || annotation.locked) return false;
-  if (annotation.type === 'arrow') {
-    // The same body the canvas draws, so a bowed arrow is picked where it is drawn
-    // and not along the straight chord between its ends.
-    const path = arrowGeometry(annotation).path;
-    const reach = Math.max(tolerance, annotation.strokeWidth * 2);
-    for (let index = 1; index < path.length; index += 1) {
-      if (distanceToLine(point, path[index - 1], path[index]) <= reach) return true;
-    }
-    return false;
-  }
-  if (annotation.type === 'pen') {
-    const points = annotation.points || [];
-    return points.some((p, index) => {
-      const previous = points[Math.max(0, index - 1)];
-      return distanceToLine(point, { x: annotation.x + previous.x, y: annotation.y + previous.y }, { x: annotation.x + p.x, y: annotation.y + p.y }) <= Math.max(tolerance, annotation.strokeWidth * 2);
-    });
-  }
-  const box = annotationBounds(annotation);
-  return point.x >= box.x - tolerance && point.x <= box.x + box.width + tolerance && point.y >= box.y - tolerance && point.y <= box.y + box.height + tolerance;
-}
-
-function resizeAnnotation(annotation: Annotation, handle: Handle, point: Point): Annotation {
-  const box = annotationBounds(annotation);
-  const opposite = {
-    x: handle.includes('w') ? box.x + box.width : box.x,
-    y: handle.includes('n') ? box.y + box.height : box.y,
-  };
-  const left = Math.min(point.x, opposite.x);
-  const top = Math.min(point.y, opposite.y);
-  const width = Math.max(3, Math.abs(point.x - opposite.x));
-  const height = Math.max(3, Math.abs(point.y - opposite.y));
-  if (annotation.type === 'arrow') {
-    return {
-      ...annotation,
-      x: annotation.width < 0 ? left + width : left,
-      y: annotation.height < 0 ? top + height : top,
-      width: annotation.width < 0 ? -width : width,
-      height: annotation.height < 0 ? -height : height,
-    };
-  }
-  if (annotation.type === 'text') {
-    const factor = Math.max(width / box.width, height / box.height);
-    return { ...annotation, x: left, y: top, width: box.width * factor, height: box.height * factor, fontSize: Math.max(8, (annotation.fontSize || 28) * factor) };
-  }
-  if (annotation.type === 'number') {
-    const side = Math.max(20, width, height);
-    return { ...annotation, x: left, y: top, width: side, height: side };
-  }
-  return {
-    ...annotation, x: left, y: top, width, height,
-    points: annotation.points?.map(p => ({ x: p.x * width / box.width, y: p.y * height / box.height })),
-  };
-}
-
-/** The box a piece of text needs, measured with the same code the canvas draws with. */
-function textDimensions(annotation: Annotation, text: string, fontSize: number) {
-  return textFrame({ ...annotation, text, fontSize: annotation.fontSize || fontSize });
-}
-
-export function EditorCanvas({ image, annotations, onChange, selectedId, onSelect, tool, color, strokeWidth, arrow, textSize, style, zoom, onToolChange, onCrop, onStatus, onZoomChange }: EditorCanvasProps) {
-  const viewportRef = useRef<HTMLDivElement>(null);
-  const artboardRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const gestureRef = useRef<Gesture | null>(null);
-  const draftRef = useRef<Annotation | null>(null);
-  const textEditorRef = useRef<TextEditor | null>(null);
+export function EditorCanvas({ image, annotations, onChange, selectedId, selectedIds, onSelect, onSelectionChange, tool, color, strokeWidth, arrow, onArrowChange, textSize, textStyle, style, zoom, onToolChange, onCrop, onStatus, loadingMessage, onZoomChange }: EditorCanvasProps) {
+  const viewportRef = useRef<HTMLDivElement>(null), artboardRef = useRef<HTMLDivElement>(null), canvasRef = useRef<HTMLCanvasElement>(null);
+  const gestureRef = useRef<Gesture | null>(null), draftsRef = useRef<Annotation[]>([]), draftFrame = useRef(0), textEditorRef = useRef<TextEditor | null>(null);
   const [viewport, setViewport] = useState({ width: 1000, height: 700 });
-  const [draft, setDraftState] = useState<Annotation | null>(null);
-  const [crop, setCrop] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
-  const [textEditor, setTextEditorState] = useState<TextEditor | null>(null);
-
-  const setDraft = (annotation: Annotation | null) => {
-    draftRef.current = annotation;
-    setDraftState(annotation);
+  const [drafts, setDraftState] = useState<Annotation[]>([]);
+  const [crop, setCrop] = useState<Box | null>(null), [marquee, setMarquee] = useState<Box | null>(null);
+  const [hoveredId, setHoveredId] = useState<string | null>(null), [textEditor, setTextEditorState] = useState<TextEditor | null>(null);
+  const [guides, setGuides] = useState<Guide[]>([]);
+  const ids = selectedIds ?? (selectedId ? [selectedId] : []);
+  const selectIds = (next: string[]) => onSelectionChange ? onSelectionChange(next) : onSelect(next.at(-1) ?? null);
+  const setDrafts = (next: Annotation[], immediate = false) => {
+    draftsRef.current = next;
+    if (immediate) { cancelAnimationFrame(draftFrame.current); draftFrame.current = 0; setDraftState(next); }
+    else if (!draftFrame.current) draftFrame.current = requestAnimationFrame(() => { draftFrame.current = 0; setDraftState(draftsRef.current); });
   };
-  const setTextEditor = (value: TextEditor | null) => {
-    textEditorRef.current = value;
-    setTextEditorState(value);
-  };
-
+  const setTextEditor = (next: TextEditor | null) => { textEditorRef.current = next; setTextEditorState(next); };
   useEffect(() => {
-    const viewportElement = viewportRef.current;
-    if (!viewportElement) return;
+    const element = viewportRef.current;
+    if (!element) return;
     let frame = 0;
     const observer = new ResizeObserver(entries => {
       const rect = entries[0]?.contentRect;
       if (!rect) return;
-      // Coalesce bursts and keep the object identity stable when nothing moved,
-      // otherwise the artboard resize and the observer can ping-pong forever.
       cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        const width = Math.round(rect.width);
-        const height = Math.round(rect.height);
-        setViewport(current => (current.width === width && current.height === height ? current : { width, height }));
-      });
+      frame = requestAnimationFrame(() => { const width = Math.round(rect.width), height = Math.round(rect.height); setViewport(c => c.width === width && c.height === height ? c : { width, height }); });
     });
-    observer.observe(viewportElement);
-    return () => { cancelAnimationFrame(frame); observer.disconnect(); };
+    observer.observe(element);
+    return () => { observer.disconnect(); cancelAnimationFrame(frame); cancelAnimationFrame(draftFrame.current); };
   }, []);
-
   const size = useMemo(() => image ? getCompositionSize(image, style) : null, [image, style]);
-  // Scrollbar room is reserved up front: without it, growing the artboard adds a
-  // scrollbar, which shrinks the viewport, which shrinks the artboard, and the
-  // studio spins at mid zoom levels.
-  const fit = size ? Math.min(
-    1,
-    Math.max(80, viewport.width - CANVAS_INSET * 2 - SCROLLBAR_ROOM) / size.width,
-    size.height > size.width * 2 ? 1 : Math.max(80, viewport.height - CANVAS_INSET * 2 - SCROLLBAR_ROOM) / size.height,
-  ) : 1;
+  const fit = size ? Math.min(1, Math.max(80, viewport.width - CANVAS_INSET * 2 - 17) / size.width, size.height > size.width * 2 ? 1 : Math.max(80, viewport.height - CANVAS_INSET * 2 - 17) / size.height) : 1;
   const displayScale = fit * Math.max(0.1, zoom);
   useEffect(() => { onZoomChange?.(displayScale); }, [displayScale, onZoomChange]);
-
   const visibleAnnotations = useMemo(() => {
-    const editingId = textEditor?.annotation.id;
-    const current = annotations.filter(a => a.id !== editingId);
-    if (!draft) return current;
-    return current.some(a => a.id === draft.id) ? current.map(a => a.id === draft.id ? draft : a) : [...current, draft];
-  }, [annotations, draft, textEditor?.annotation.id]);
-
+    const replacements = new Map(drafts.map(a => [a.id, a]));
+    return [...annotations.filter(a => a.id !== textEditor?.annotation.id).map(a => replacements.get(a.id) || a), ...drafts.filter(a => !annotations.some(old => old.id === a.id))];
+  }, [annotations, drafts, textEditor?.annotation.id]);
   useEffect(() => {
     if (!image || !size || !canvasRef.current) return;
-    const canvas = canvasRef.current;
-    const rasterScale = Math.min(1, displayScale * Math.min(window.devicePixelRatio || 1, 2), 16000 / Math.max(size.width, size.height), Math.sqrt(12000000 / (size.width * size.height)));
-    const frame = requestAnimationFrame(() => renderComposition(image, visibleAnnotations, style, rasterScale, canvas));
-    return () => cancelAnimationFrame(frame);
+    const scale = Math.min(1, displayScale * Math.min(window.devicePixelRatio || 1, 2), 16000 / Math.max(size.width, size.height), Math.sqrt(12000000 / (size.width * size.height)));
+    // Drafts are already frame-coalesced. A second RAF would delay visible ink.
+    renderComposition(image, visibleAnnotations, style, scale, canvasRef.current);
   }, [image, visibleAnnotations, style, displayScale, size]);
-
+  const cancelGesture = () => {
+    const gesture = gestureRef.current; gestureRef.current = null;
+    if (gesture && artboardRef.current?.hasPointerCapture(gesture.pointerId)) artboardRef.current.releasePointerCapture(gesture.pointerId);
+    setDrafts([], true); setCrop(null); setMarquee(null); setGuides([]);
+    if (gesture) selectIds(gesture.initialSelection);
+  };
+  useEffect(() => { gestureRef.current = null; setDrafts([], true); setCrop(null); setMarquee(null); setTextEditor(null); setGuides([]); }, [image]);
   useEffect(() => {
-    gestureRef.current = null;
-    setDraft(null);
-    setCrop(null);
-    setTextEditor(null);
-  }, [image]);
-
-  const coordinates = (event: ReactPointerEvent<HTMLDivElement>, clamp = true): Point => {
-    const rect = artboardRef.current!.getBoundingClientRect();
-    const x = (event.clientX - rect.left) / displayScale - (size?.imageX || 0);
-    const y = (event.clientY - rect.top) / displayScale - (size?.imageY || 0);
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape' && gestureRef.current) { event.preventDefault(); event.stopImmediatePropagation(); cancelGesture(); } };
+    window.addEventListener('keydown', onKey, true); return () => window.removeEventListener('keydown', onKey, true);
+  });
+  useEffect(() => { if (gestureRef.current) cancelGesture(); setHoveredId(null); }, [tool]);
+  const coordinates = (event: { clientX: number; clientY: number }, clamp = false): Point => {
+    const gesture = gestureRef.current, rect = gesture?.rect ?? artboardRef.current!.getBoundingClientRect(), scale = gesture?.scale ?? displayScale;
+    const x = (event.clientX - rect.left) / scale - (size?.imageX || 0), y = (event.clientY - rect.top) / scale - (size?.imageY || 0);
     return clamp && size ? { x: Math.max(0, Math.min(size.imageWidth, x)), y: Math.max(0, Math.min(size.imageHeight, y)) } : { x, y };
   };
-
-  const commitText = () => {
+  const commitText = (value?: string) => {
     const editor = textEditorRef.current;
     if (!editor) return;
+    if (value !== undefined) editor.value = value;
     setTextEditor(null);
-    const text = editor.value.trim();
-    if (!text) {
-      if (!editor.isNew) onChange(annotations.filter(a => a.id !== editor.annotation.id));
-      onSelect(null);
-      return;
-    }
-    const annotation = { ...editor.annotation, text, ...textDimensions(editor.annotation, text, textSize) };
-    onChange(editor.isNew ? [...annotations, annotation] : annotations.map(a => a.id === annotation.id ? annotation : a));
-    onSelect(annotation.id);
-    onToolChange?.('select');
+    if (!editor.value.trim()) { if (!editor.isNew) onChange(annotations.filter(a => a.id !== editor.annotation.id)); onSelect(null); return; }
+    const annotation = { ...editor.annotation, text: editor.value, ...textFrame({ ...editor.annotation, text: editor.value }) };
+    if (editor.isNew || annotation.text !== editor.annotation.text) onChange(editor.isNew ? [...annotations, annotation] : annotations.map(a => a.id === annotation.id ? annotation : a));
+    onSelect(annotation.id); onToolChange?.('select');
   };
-
+  useEffect(() => {
+    const editor = textEditorRef.current;
+    if (!editor) return;
+    const source = editor.isNew ? { ...editor.annotation, color: textStyle?.color ?? '#000000', fontSize: textSize,
+      fontFamily: textStyle?.fontFamily, fontWeight: textStyle?.fontWeight, lineHeight: textStyle?.lineHeight,
+      letterSpacing: textStyle?.letterSpacing, align: textStyle?.align } : annotations.find(a => a.id === editor.annotation.id);
+    const keys: (keyof Annotation)[] = ['color', 'fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'letterSpacing', 'align', 'opacity', 'x', 'y'];
+    if (source && keys.some(key => source[key] !== editor.annotation[key])) setTextEditor({ ...editor, annotation: source });
+  }, [annotations, textStyle, textSize]);
+  useEffect(() => {
+    const edit = (event: KeyboardEvent) => {
+      if (event.key !== 'Enter' || textEditorRef.current || gestureRef.current || (event.target as HTMLElement)?.closest('input,textarea,select,[contenteditable="true"]')) return;
+      const target = annotations.find(a => a.id === selectedId && a.type === 'text' && !a.hidden && !a.locked);
+      if (target) { event.preventDefault(); setTextEditor({ annotation: target, value: target.text || '', isNew: false }); }
+    };
+    window.addEventListener('keydown', edit);
+    return () => window.removeEventListener('keydown', edit);
+  }, [annotations, selectedId]);
   const pointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!image || !size || event.button !== 0 || textEditorRef.current) return;
-    const point = coordinates(event, false);
-    const target = event.target as Element;
-    const handle = target.getAttribute?.('data-handle') as Handle | null;
-    const selected = annotations.find(a => a.id === selectedId && !a.hidden && !a.locked);
-    if (handle && selected) {
-      event.preventDefault();
-      event.currentTarget.setPointerCapture(event.pointerId);
-      gestureRef.current = { mode: 'resize', start: point, base: selected, handle };
-      setDraft(selected);
-      return;
-    }
-    // The bend handle sits on the arrow's own body, so it is picked before the
-    // layer underneath it.
-    if (target.getAttribute?.('data-bend') && selected?.type === 'arrow' && (selected.arrowStyle || 'straight') !== 'straight') {
-      event.preventDefault();
-      event.currentTarget.setPointerCapture(event.pointerId);
-      gestureRef.current = { mode: 'bend', start: point, base: selected };
-      setDraft(selected);
-      return;
-    }
-    if (point.x < 0 || point.y < 0 || point.x > size.imageWidth || point.y > size.imageHeight) {
-      onSelect(null);
-      return;
-    }
+    if (!image || !size || event.button !== 0 || textEditorRef.current || gestureRef.current) return;
+    const point = coordinates(event), target = event.target as Element;
+    const selected = annotations.filter(a => ids.includes(a.id) && !a.hidden && !a.locked);
+    const start = (mode: Gesture['mode'], base: Annotation[] = [], extra: Partial<Gesture> = {}) => {
+      event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); setHoveredId(null);
+      gestureRef.current = { mode, pointerId: event.pointerId, start: point, rect: event.currentTarget.getBoundingClientRect(), scale: displayScale, base, initialSelection: [...ids], ...extra };
+    };
+    const handle = target.getAttribute('data-handle') as Handle | null, endpoint = target.getAttribute('data-endpoint') as 'tail' | 'tip' | null;
+    if (handle && selected.length && !selected.some(a => a.type === 'highlight')) { start('resize', selected, { handle, bounds: selectionBounds(selected)! }); setDrafts(selected); return; }
+    if (endpoint && selected.length === 1 && selected[0].type === 'arrow') { start('endpoint', selected, { endpoint }); setDrafts(selected); return; }
+    if (target.hasAttribute('data-bend') && selected.length === 1 && selected[0].type === 'arrow') { start('bend', selected); setDrafts(selected); return; }
+    if (point.x < 0 || point.y < 0 || point.x > size.imageWidth || point.y > size.imageHeight) { onSelect(null); return; }
     if (tool === 'select') {
-      const target = [...annotations].reverse().find(a => contains(a, point, 7 / displayScale));
-      onSelect(target?.id || null);
-      if (target) {
-        event.preventDefault();
-        event.currentTarget.setPointerCapture(event.pointerId);
-        gestureRef.current = { mode: 'move', start: point, base: target };
-        setDraft(target);
+      const hit = [...annotations].reverse().find(a => contains(a, point, 5 / displayScale)), additive = event.shiftKey || event.metaKey || event.ctrlKey;
+      if (hit) {
+        const next = additive ? ids.includes(hit.id) ? ids.filter(id => id !== hit.id) : [...ids, hit.id] : ids.includes(hit.id) ? ids : [hit.id];
+        selectIds(next); if (!next.includes(hit.id)) return;
+        const base = annotations.filter(a => next.includes(a.id) && !a.locked && !a.hidden);
+        start('move', base, { bounds: selectionBounds(base)! }); setDrafts(base);
+      } else {
+        start('marquee', [], { initialSelection: additive ? [...ids] : [] }); if (!additive) selectIds([]); setMarquee({ ...point, width: 0, height: 0 });
       }
       return;
     }
-    if (tool === 'crop') {
-      if (!onCrop) { onStatus?.('Cropping is unavailable for this image.'); return; }
-      event.preventDefault();
-      event.currentTarget.setPointerCapture(event.pointerId);
-      onSelect(null);
-      gestureRef.current = { mode: 'crop', start: point };
-      setCrop({ ...point, width: 0, height: 0 });
-      return;
-    }
-    const annotation: Annotation = {
-      id: crypto.randomUUID(), type: tool, x: point.x, y: point.y, width: 0, height: 0, color, strokeWidth,
-    };
-    if (tool === 'arrow') {
-      // A new arrow starts on the style, bend and head last used, so the next one in a
-      // series matches without touching the panel again.
-      Object.assign(annotation, arrow);
-    }
+    if (tool === 'crop') { if (!onCrop) { onStatus?.('Cropping is unavailable for this image.'); return; } start('crop'); onSelect(null); setCrop({ ...point, width: 0, height: 0 }); return; }
+    const annotation: Annotation = { id: crypto.randomUUID(), type: tool, x: point.x, y: point.y, width: 0, height: 0, color, strokeWidth };
+    if (tool === 'arrow') Object.assign(annotation, arrow);
     if (tool === 'text') {
-      // Keep the original pointer's default focus action from immediately
-      // blurring the inline editor that React mounts during this event.
       event.preventDefault();
-      // Type reads as type: black ink first, never the colour the last shape used.
-      annotation.color = '#000000';
-      annotation.fontSize = textSize;
-      const frame = textDimensions(annotation, '', textSize);
-      annotation.width = frame.width;
-      annotation.height = frame.height;
-      setTextEditor({ annotation, value: '', isNew: true });
-      onSelect(null);
-      return;
+      Object.assign(annotation, { color: textStyle?.color ?? '#000000', fontSize: textSize, fontFamily: textStyle?.fontFamily, fontWeight: textStyle?.fontWeight, lineHeight: textStyle?.lineHeight, letterSpacing: textStyle?.letterSpacing, align: textStyle?.align });
+      Object.assign(annotation, textFrame(annotation)); setTextEditor({ annotation, value: '', isNew: true }); onSelect(null); return;
     }
     if (tool === 'number') {
       const diameter = Math.max(36, textSize * 1.4);
-      annotation.x -= diameter / 2;
-      annotation.y -= diameter / 2;
-      annotation.width = diameter;
-      annotation.height = diameter;
-      annotation.number = 1 + Math.max(0, ...annotations.filter(a => a.type === 'number').map(a => a.number || 0));
-      onChange([...annotations, annotation]);
-      onSelect(annotation.id);
-      return;
+      Object.assign(annotation, { x: point.x - diameter / 2, y: point.y - diameter / 2, width: diameter, height: diameter, number: 1 + Math.max(0, ...annotations.filter(a => a.type === 'number').map(a => a.number || 0)) });
+      onChange([...annotations, annotation]); onSelect(annotation.id); return;
     }
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    gestureRef.current = { mode: 'draw', start: point, base: annotation, points: tool === 'pen' ? [point] : undefined };
-    if (tool === 'pen') annotation.points = [{ x: 0, y: 0 }];
-    setDraft(annotation);
-    onSelect(annotation.id);
+    const traced = tool === 'pen' || tool === 'highlight';
+    if (traced) annotation.points = [{ x: 0, y: 0 }];
+    start('draw', [annotation], { points: traced ? [point] : undefined, freehand: event.altKey }); setDrafts([annotation]); onSelect(annotation.id);
   };
-
   const pointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     const gesture = gestureRef.current;
-    if (!gesture || !size) return;
-    const point = coordinates(event);
-    if (gesture.mode === 'crop') {
-      setCrop({ x: Math.min(gesture.start.x, point.x), y: Math.min(gesture.start.y, point.y), width: Math.abs(point.x - gesture.start.x), height: Math.abs(point.y - gesture.start.y) });
+    if (!size) return;
+    if (!gesture) { if (tool === 'select' && !textEditor) setHoveredId([...annotations].reverse().find(a => contains(a, coordinates(event), 5 / displayScale))?.id ?? null); return; }
+    if (event.pointerId !== gesture.pointerId) return;
+    const point = coordinates(event, gesture.mode === 'draw' || gesture.mode === 'crop'), dx = point.x - gesture.start.x, dy = point.y - gesture.start.y;
+    gesture.moved ||= Math.hypot(dx, dy) * gesture.scale > 2;
+    setGuides([]);
+    if (gesture.mode === 'marquee' || gesture.mode === 'crop') {
+      const box = { x: Math.min(gesture.start.x, point.x), y: Math.min(gesture.start.y, point.y), width: Math.abs(dx), height: Math.abs(dy) };
+      if (gesture.mode === 'crop') setCrop(box);
+      else { setMarquee(box); const hits = gesture.moved ? annotations.filter(a => { if (a.hidden || a.locked) return false; const b = annotationBounds(a); return b.x >= box.x && b.y >= box.y && b.x + b.width <= box.x + box.width && b.y + b.height <= box.y + box.height; }).map(a => a.id) : []; selectIds([...new Set([...gesture.initialSelection, ...hits])]); }
       return;
     }
-    const base = gesture.base;
-    if (!base) return;
-    if (gesture.mode === 'move') {
-      const x = base.x + point.x - gesture.start.x;
-      const y = base.y + point.y - gesture.start.y;
-      setDraft({ ...base, x, y });
+    const base = gesture.base[0]; if (!base) return;
+    if (gesture.mode === 'move' && gesture.bounds) {
+      if (!gesture.moved) return;
+      let mx = dx, my = dy;
+      if (event.shiftKey) { if (Math.abs(dx) >= Math.abs(dy)) my = 0; else mx = 0; }
+      const box = gesture.bounds, guides: Guide[] = [];
+      if (!event.altKey) {
+        const others = [{ x: 0, y: 0, width: size.imageWidth, height: size.imageHeight }, ...annotations.filter(a => !a.hidden && !gesture.base.some(b => b.id === a.id)).map(annotationBounds)];
+        for (const axis of ['x', 'y'] as const) {
+          if (event.shiftKey && ((axis === 'x' && mx === 0) || (axis === 'y' && my === 0))) continue;
+          const length = axis === 'x' ? 'width' : 'height', origin = box[axis] + (axis === 'x' ? mx : my);
+          let best = 5 / gesture.scale, offset = 0, at: number | null = null;
+          for (const other of others) for (const target of [other[axis], other[axis] + other[length] / 2, other[axis] + other[length]]) for (const edge of [origin, origin + box[length] / 2, origin + box[length]]) {
+            const delta = target - edge; if (Math.abs(delta) < best) { best = Math.abs(delta); offset = delta; at = target; }
+          }
+          if (axis === 'x') mx += offset; else my += offset;
+          if (at !== null) guides.push(axis === 'x' ? { from: { x: at, y: 0 }, to: { x: at, y: size.imageHeight } } : { from: { x: 0, y: at }, to: { x: size.imageWidth, y: at } });
+        }
+      }
+      setGuides(guides); setDrafts(gesture.base.map(a => ({ ...a, x: a.x + mx, y: a.y + my })));
+    } else if (gesture.mode === 'resize' && gesture.handle && gesture.bounds) {
+      const next = resizeBox(gesture.bounds, gesture.handle, point, event.shiftKey || gesture.base.some(a => a.type === 'text'), event.altKey);
+      setDrafts(gesture.base.map(a => transformAnnotation(a, gesture.bounds!, next)));
     } else if (gesture.mode === 'bend') {
-      setDraft({ ...base, curve: arrowCurveAt(base, point) });
-    } else if (gesture.mode === 'resize' && gesture.handle) {
-      setDraft(resizeAnnotation(base, gesture.handle, point));
-    } else if (base.type === 'pen') {
-      const points = gesture.points || [gesture.start];
-      const last = points[points.length - 1];
-      if (Math.hypot(point.x - last.x, point.y - last.y) < 0.8 / displayScale) return;
-      points.push(point);
-      gesture.points = points;
-      const minX = Math.min(...points.map(p => p.x));
-      const minY = Math.min(...points.map(p => p.y));
-      const maxX = Math.max(...points.map(p => p.x));
-      const maxY = Math.max(...points.map(p => p.y));
-      setDraft({ ...base, x: minX, y: minY, width: Math.max(1, maxX - minX), height: Math.max(1, maxY - minY), points: points.map(p => ({ x: p.x - minX, y: p.y - minY })) });
+      if (!gesture.moved) return;
+      const curved = { ...base, arrowStyle: base.arrowStyle === 'elbow' ? 'elbow' as const : 'curved' as const }, curve = arrowCurveAt({ ...base, arrowStyle: base.arrowStyle === 'elbow' ? 'elbow' : 'curved' }, point);
+      setDrafts([{ ...curved, curve, arrowStyle: curved.arrowStyle === 'curved' && Math.abs(curve) < 0.015 ? 'straight' : curved.arrowStyle }]);
+    } else if (gesture.mode === 'endpoint') {
+      const fixed = gesture.endpoint === 'tail' ? { x: base.x + base.width, y: base.y + base.height } : { x: base.x, y: base.y }, tip = event.shiftKey ? snapAngle(fixed, point) : point;
+      setDrafts([gesture.endpoint === 'tail' ? { ...base, x: tip.x, y: tip.y, width: fixed.x - tip.x, height: fixed.y - tip.y } : { ...base, width: tip.x - base.x, height: tip.y - base.y }]);
+    } else if (base.type === 'pen' || base.type === 'highlight') {
+      const points = gesture.points!;
+      if (event.shiftKey) {
+        if (!gesture.anchor) { gesture.anchor = points.at(-1)!; gesture.snapped = false; }
+        const tip = snapAngle(gesture.anchor, point);
+        if (gesture.snapped) points[points.length - 1] = tip; else { points.push(tip); gesture.snapped = true; }
+        setGuides([{ from: gesture.anchor, to: tip }]); setDrafts([tracedAnnotation(base, points)]); return;
+      }
+      gesture.anchor = undefined; gesture.snapped = false; gesture.freehand ||= event.altKey;
+      const samples = event.nativeEvent.getCoalescedEvents?.() ?? [];
+      for (const sample of samples.length ? samples : [event]) { const next = coordinates(sample, true), last = points.at(-1)!; if (Math.hypot(next.x - last.x, next.y - last.y) >= 0.6 / gesture.scale) points.push(next); }
+      // Keep raw samples: Alt or leaving the row instantly restores freehand ink.
+      const row = base.type === 'highlight' && !gesture.freehand && Math.abs(dx) * gesture.scale >= 12 && Math.abs(dy) <= Math.max(6 / gesture.scale, Math.abs(dx) * 0.22) && points.every(p => Math.abs(p.y - gesture.start.y) <= Math.max(8 / gesture.scale, Math.abs(dx) * 0.24));
+      const path = row ? [gesture.start, { x: point.x, y: gesture.start.y }] : points;
+      if (row) setGuides([{ from: gesture.start, to: path[1] }]);
+      setDrafts([tracedAnnotation(base, path)]);
     } else {
-      let width = point.x - gesture.start.x;
-      let height = point.y - gesture.start.y;
-      if (event.shiftKey && ['rectangle', 'ellipse'].includes(base.type)) {
-        const side = Math.max(Math.abs(width), Math.abs(height));
-        width = side * (width < 0 ? -1 : 1);
-        height = side * (height < 0 ? -1 : 1);
-      }
-      if (event.shiftKey && base.type === 'arrow') {
-        const angle = Math.round(Math.atan2(height, width) / (Math.PI / 4)) * Math.PI / 4;
-        const length = Math.hypot(width, height);
-        width = Math.cos(angle) * length;
-        height = Math.sin(angle) * length;
-      }
-      setDraft({ ...base, width, height });
+      let width = dx, height = dy;
+      if (event.shiftKey && ['rectangle', 'ellipse'].includes(base.type)) { const side = Math.max(Math.abs(dx), Math.abs(dy)); width = side * (dx < 0 ? -1 : 1); height = side * (dy < 0 ? -1 : 1); }
+      if (event.shiftKey && base.type === 'arrow') { const tip = snapAngle(gesture.start, point); width = tip.x - base.x; height = tip.y - base.y; }
+      setDrafts([{ ...base, width, height }]);
     }
   };
-
   const pointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const gesture = gestureRef.current;
-    if (!gesture) return;
-    gestureRef.current = null;
+    const gesture = gestureRef.current; if (!gesture || gesture.pointerId !== event.pointerId) return;
+    pointerMove(event); // Preserve the release position even if the last move was coalesced.
+    const end = coordinates(event, gesture.mode === 'crop'); gestureRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    setGuides([]); setMarquee(null); if (gesture.mode === 'marquee') return;
     if (gesture.mode === 'crop' && image && size) {
-      const end = coordinates(event);
-      const x = Math.floor(Math.min(gesture.start.x, end.x));
-      const y = Math.floor(Math.min(gesture.start.y, end.y));
-      const width = Math.floor(Math.abs(end.x - gesture.start.x));
-      const height = Math.floor(Math.abs(end.y - gesture.start.y));
-      setCrop(null);
-      if (width < 8 || height < 8) return;
-      const cropped = document.createElement('canvas');
-      cropped.width = width;
-      cropped.height = height;
-      const context = cropped.getContext('2d');
-      if (!context) { onStatus?.('Could not crop this image. Please try again.'); return; }
+      const x = Math.floor(Math.min(gesture.start.x, end.x)), y = Math.floor(Math.min(gesture.start.y, end.y)), width = Math.floor(Math.abs(end.x - gesture.start.x)), height = Math.floor(Math.abs(end.y - gesture.start.y));
+      setCrop(null); if (width < 8 || height < 8) return;
+      const cropped = document.createElement('canvas'); cropped.width = width; cropped.height = height;
+      const context = cropped.getContext('2d'); if (!context) { onStatus?.('Could not crop this image. Please try again.'); return; }
       context.drawImage(image, x, y, width, height, 0, 0, width, height);
-      const retained = annotations.filter(a => {
-        const bounds = annotationBounds(a);
-        return bounds.x + bounds.width > x && bounds.x < x + width && bounds.y + bounds.height > y && bounds.y < y + height;
-      }).map(a => ({ ...a, x: a.x - x, y: a.y - y }));
-      onCrop?.(cropped.toDataURL('image/png'), retained);
-      onSelect(null);
-      onToolChange?.('select');
-      onStatus?.('Image cropped. You can undo to restore the original.');
-      return;
+      const retained = annotations.filter(a => { const b = annotationBounds(a); return b.x + b.width > x && b.x < x + width && b.y + b.height > y && b.y < y + height; }).map(a => ({ ...a, x: a.x - x, y: a.y - y }));
+      onCrop?.(cropped.toDataURL('image/png'), retained); onSelect(null); onToolChange?.('select'); return;
     }
-    const completed = draftRef.current;
-    setDraft(null);
-    if (!completed) return;
-    if (gesture.mode === 'draw' && completed.type !== 'pen' && Math.hypot(completed.width, completed.height) < 4 / displayScale) { onSelect(null); return; }
-    if (gesture.mode === 'move' && gesture.base?.x === completed.x && gesture.base?.y === completed.y) return;
-    const normalized = completed.type === 'arrow' ? completed : { ...completed, ...annotationBounds(completed) };
-    onChange(gesture.mode === 'draw' ? [...annotations, normalized] : annotations.map(a => a.id === completed.id ? normalized : a));
+    const completed = draftsRef.current; setDrafts([], true);
+    if (!completed.length || (gesture.mode !== 'draw' && !gesture.moved)) return;
+    if (gesture.mode === 'draw' && !['pen', 'highlight'].includes(completed[0].type) && Math.hypot(completed[0].width, completed[0].height) < 4 / gesture.scale) { onSelect(null); return; }
+    // Stroke bounds include ink thickness; copying them into x/y shifts every point.
+    const normalized = completed.map(a => ['rectangle', 'ellipse', 'blur'].includes(a.type) ? { ...a, ...annotationBounds(a) } : a), replacements = new Map(normalized.map(a => [a.id, a]));
+    onChange(gesture.mode === 'draw' ? [...annotations, ...normalized] : annotations.map(a => replacements.get(a.id) || a));
   };
-
-  const cancelGesture = () => {
-    gestureRef.current = null;
-    setDraft(null);
-    setCrop(null);
-  };
-
-  const selected = visibleAnnotations.find(a => a.id === selectedId && !a.hidden);
-  const selection = selected ? annotationBounds(selected) : null;
-  const cursor = tool === 'select'
-    ? gestureRef.current?.mode === 'move' ? 'grabbing' : gestureRef.current?.mode === 'bend' ? 'grabbing' : 'default'
-    : tool === 'text' ? 'text' : 'crosshair';
+  const selectedItems = visibleAnnotations.filter(a => ids.includes(a.id) && !a.hidden), selected = selectedItems.length === 1 ? selectedItems[0] : undefined;
+  const selection = selectionBounds(selectedItems), locked = selectedItems.some(a => a.locked), drawing = gestureRef.current?.mode === 'draw';
+  const markerSelected = selected?.type === 'highlight';
+  const canResize = !selectedItems.some(a => a.type === 'highlight');
+  const showSelection = selection && !textEditor && !crop && !drawing && !marquee;
+  const hovered = !gestureRef.current && !ids.includes(hoveredId || '') ? annotations.find(a => a.id === hoveredId && !a.hidden) : undefined, hoverBox = hovered ? annotationBounds(hovered) : null;
   const handlePositions: { key: Handle; x: number; y: number }[] = selection ? [
-    { key: 'nw', x: selection.x, y: selection.y },
-    { key: 'ne', x: selection.x + selection.width, y: selection.y },
-    { key: 'sw', x: selection.x, y: selection.y + selection.height },
-    { key: 'se', x: selection.x + selection.width, y: selection.y + selection.height },
+    { key: 'nw', x: selection.x, y: selection.y }, { key: 'n', x: selection.x + selection.width / 2, y: selection.y }, { key: 'ne', x: selection.x + selection.width, y: selection.y }, { key: 'e', x: selection.x + selection.width, y: selection.y + selection.height / 2 },
+    { key: 'se', x: selection.x + selection.width, y: selection.y + selection.height }, { key: 's', x: selection.x + selection.width / 2, y: selection.y + selection.height }, { key: 'sw', x: selection.x, y: selection.y + selection.height }, { key: 'w', x: selection.x, y: selection.y + selection.height / 2 },
   ] : [];
-  // Only a bent arrow can be bent further, so the handle belongs to those alone.
-  const bent = selected?.type === 'arrow' && (selected.arrowStyle || 'straight') !== 'straight' && !selected.locked;
-  const bendHandle = bent && !textEditor && !crop ? arrowBendPoint(selected) : null;
-  const chord = bent ? { x: selected.x + selected.width / 2, y: selected.y + selected.height / 2 } : null;
-  const editorMetrics = textMetrics({
-    id: 'editor', type: 'text', x: 0, y: 0, width: 0, height: 0, color: '#000000', strokeWidth: 0,
-    ...(textEditor ? { ...textEditor.annotation, text: textEditor.value } : {}),
-  });
-  const overlayBase: CSSProperties = { position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'visible', pointerEvents: 'none' };
-
+  const selectedArrow = selected?.type === 'arrow' && !locked ? selected : undefined;
+  const bendHandle = selectedArrow ? (selectedArrow.arrowStyle || 'straight') === 'straight' ? { x: selectedArrow.x + selectedArrow.width / 2, y: selectedArrow.y + selectedArrow.height / 2 } : arrowBendPoint(selectedArrow) : null;
+  const lineControls = !textEditor && !gestureRef.current && (selectedArrow || (tool === 'arrow' && !selectedItems.length)), lineStyle = selectedArrow?.arrowStyle ?? arrow.arrowStyle;
+  const changeArrow = (patch: Partial<Annotation>) => { if (onArrowChange) onArrowChange(patch); else if (selectedArrow) onChange(annotations.map(a => a.id === selectedArrow.id ? { ...a, ...patch } : a)); };
+  const overlay: CSSProperties = { position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'visible', pointerEvents: 'none' };
+  const cursor = tool === 'select' ? gestureRef.current ? 'grabbing' : hoveredId ? 'move' : 'default' : tool === 'text' ? 'text' : 'crosshair';
   return (
-    <div ref={viewportRef} className="flex-1 w-full h-full min-w-0 min-h-0 overflow-auto scrollbar-none relative overscroll-contain">
+    <div ref={viewportRef} data-testid="editor-viewport" className="flex-1 w-full h-full min-w-0 min-h-0 overflow-auto scrollbar-none relative overscroll-contain" style={{ overflowAnchor: 'none' }}>
       <div className="flex items-center justify-center w-max min-w-full min-h-full box-border" style={{ padding: CANVAS_INSET }}>
-        {image && size ? (
-          <div
-            ref={artboardRef}
-            data-testid="editor-artboard"
-            className="relative shrink-0 touch-none select-none"
-            aria-label="Screenshot canvas. Choose a tool to annotate, or select a layer to move it."
-            role="application"
-            onPointerDown={pointerDown}
-            onPointerMove={pointerMove}
-            onPointerUp={pointerUp}
-            onPointerCancel={cancelGesture}
-            onDoubleClick={event => {
-              if (tool !== 'select') return;
-              const rect = artboardRef.current!.getBoundingClientRect();
-              const point = { x: (event.clientX - rect.left) / displayScale - size.imageX, y: (event.clientY - rect.top) / displayScale - size.imageY };
-              const target = [...annotations].reverse().find(a => a.type === 'text' && contains(a, point, 4 / displayScale));
-              if (target) { setTextEditor({ annotation: target, value: target.text || '', isNew: false }); onSelect(null); }
-            }}
-            style={{ width: size.width * displayScale, height: size.height * displayScale, cursor }}
-          >
-            <canvas ref={canvasRef} aria-label="Screenshot composition preview" className="block w-full h-full" />
-            <svg style={overlayBase} viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden="true">
-              <g transform={`translate(${size.imageX} ${size.imageY})`}>
-                {selection && !textEditor && !crop && (
-                  <>
-                    <rect x={selection.x} y={selection.y} width={selection.width} height={selection.height} fill="rgba(98, 68, 224, 0.04)" stroke={ACCENT} strokeWidth={1.25 / displayScale} strokeDasharray={selected?.locked ? `${4 / displayScale} ${3 / displayScale}` : undefined} />
-                    {!selected?.locked && handlePositions.map(handle => (
-                      <rect key={handle.key} data-handle={handle.key} x={handle.x - 3.5 / displayScale} y={handle.y - 3.5 / displayScale} width={7 / displayScale} height={7 / displayScale} rx={1 / displayScale} fill="white" stroke={ACCENT} strokeWidth={1.25 / displayScale} style={{ pointerEvents: 'all', cursor: `${handle.key}-resize` }} />
-                    ))}
-                    {bendHandle && chord && (
-                      <g className="group">
-                        <line x1={chord.x} y1={chord.y} x2={bendHandle.x} y2={bendHandle.y} stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={`${3 / displayScale} ${3 / displayScale}`} opacity={0.7} />
-                        {/* A generous invisible target, so the handle is easy to grab at any zoom. */}
-                        <circle data-bend="1" cx={bendHandle.x} cy={bendHandle.y} r={9 / displayScale} fill="transparent" className="cursor-grab group-hover:cursor-grab" style={{ pointerEvents: 'all' }} />
-                        <circle cx={bendHandle.x} cy={bendHandle.y} r={4.5 / displayScale} fill="white" stroke={ACCENT} strokeWidth={1.5 / displayScale} className="transition-[fill] duration-100 group-hover:fill-[#ece9fe]" style={{ pointerEvents: 'none' }} />
-                      </g>
-                    )}
-                  </>
-                )}
-                {crop && (
-                  <>
-                    <path d={`M 0 0 H ${size.imageWidth} V ${size.imageHeight} H 0 Z M ${crop.x} ${crop.y} V ${crop.y + crop.height} H ${crop.x + crop.width} V ${crop.y} Z`} fill="rgba(30, 30, 38, 0.5)" fillRule="evenodd" />
-                    <rect x={crop.x} y={crop.y} width={crop.width} height={crop.height} fill="none" stroke="white" strokeWidth={1.5 / displayScale} strokeDasharray={`${6 / displayScale} ${4 / displayScale}`} />
-                    <path d={`M ${crop.x + crop.width / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x + crop.width * 2 / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x} ${crop.y + crop.height / 3} H ${crop.x + crop.width} M ${crop.x} ${crop.y + crop.height * 2 / 3} H ${crop.x + crop.width}`} fill="none" stroke="rgba(255,255,255,.4)" strokeWidth={0.5 / displayScale} />
-                  </>
-                )}
-              </g>
-            </svg>
-            {textEditor && (
-              <textarea
-                key={textEditor.annotation.id}
-                autoFocus
-                aria-label="Annotation text"
-                placeholder="Type something…"
-                value={textEditor.value}
-                onChange={event => setTextEditor({ ...textEditor, value: event.target.value })}
-                onPointerDown={event => event.stopPropagation()}
-                onBlur={commitText}
-                onKeyDown={event => {
-                  event.stopPropagation();
-                  if (event.key === 'Escape') { setTextEditor(null); onSelect(null); }
-                  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); commitText(); }
-                }}
-                style={{
-                  position: 'absolute',
-                  left: (size.imageX + textEditor.annotation.x) * displayScale - 5,
-                  top: (size.imageY + textEditor.annotation.y) * displayScale - 4,
-                  // The editor box follows the same metrics as the canvas, so what is
-                  // typed is exactly what the layer renders.
-                  width: Math.max(160, Math.min(size.imageWidth - textEditor.annotation.x, textDimensions(textEditor.annotation, textEditor.value || 'Type something…', textSize).width + 40)) * displayScale,
-                  height: Math.max(44, textDimensions(textEditor.annotation, textEditor.value || 'Type something…', textSize).height * displayScale + 8),
-                  padding: '4px',
-                  resize: 'none',
-                  border: `1.5px solid ${ACCENT}`,
-                  borderRadius: 3,
-                  outline: 'none',
-                  background: 'rgba(255, 255, 255, .88)',
-                  boxShadow: '0 4px 16px rgba(30,24,58,.12)',
-                  color: textEditor.annotation.color,
-                  fontFamily: textStack(textEditor.annotation.fontFamily),
-                  fontSize: Math.max(12, editorMetrics.size * displayScale),
-                  fontWeight: editorMetrics.weight,
-                  lineHeight: editorMetrics.lineHeight,
-                  letterSpacing: editorMetrics.letterSpacing * displayScale,
-                  textAlign: editorMetrics.align,
-                  overflow: 'hidden',
-                  userSelect: 'text',
-                  zIndex: 5,
-                }}
-              />
-            )}
-          </div>
-        ) : (
-          <div className="flex flex-col items-center gap-2 text-center text-ink-3">
-            <strong className="text-[13px] font-medium text-ink">No image loaded</strong>
-            <span className="text-app">Drop a screenshot here, or import one from the file menu.</span>
-          </div>
-        )}
+        {image && size ? <div ref={artboardRef} data-testid="editor-artboard" className="relative shrink-0 touch-none select-none" role="application" aria-label="Screenshot canvas. Drag to draw, select a layer, or drag empty space to select several layers."
+          onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={cancelGesture} onLostPointerCapture={() => { if (gestureRef.current) cancelGesture(); }} onPointerLeave={() => setHoveredId(null)} onDragStart={event => event.preventDefault()}
+          onDoubleClick={event => {
+            if ((event.target as Element).hasAttribute('data-bend')) { changeArrow({ arrowStyle: 'straight', curve: 0 }); return; }
+            if (tool !== 'select' || textEditorRef.current) return;
+            const target = [...annotations].reverse().find(a => a.type === 'text' && contains(a, coordinates(event), 4 / displayScale));
+            if (target) { setTextEditor({ annotation: target, value: target.text || '', isNew: false }); onSelect(target.id); }
+          }} style={{ width: size.width * displayScale, height: size.height * displayScale, cursor }}>
+          <canvas ref={canvasRef} aria-label="Screenshot composition preview" className="block w-full h-full" />
+          <svg style={overlay} viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden="true"><g transform={`translate(${size.imageX} ${size.imageY})`}>
+            {showSelection && selection && <>
+              {!markerSelected && <rect data-testid="selection-bounds" {...selection} fill="none" stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={locked ? `${4 / displayScale} ${3 / displayScale}` : undefined} opacity={selectedArrow ? 0.4 : 1} />}
+              {markerSelected && tool === 'select' && selected.points?.length && <polyline data-testid="selected-marker" points={strokePath(selected).map(p => `${p.x},${p.y}`).join(' ')} fill="none" stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={`${3 / displayScale} ${3 / displayScale}`} opacity={0.7} />}
+              {selectedItems.length > 1 && selectedItems.map(a => <rect key={a.id} {...annotationBounds(a)} fill="none" stroke={ACCENT} strokeWidth={0.7 / displayScale} opacity={0.5} />)}
+              {!locked && !selectedArrow && canResize && handlePositions.map(h => <g key={h.key}>
+                <rect data-handle={h.key} x={h.x - 7 / displayScale} y={h.y - 7 / displayScale} width={14 / displayScale} height={14 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: `${h.key}-resize` }} />
+                <rect x={h.x - 3 / displayScale} y={h.y - 3 / displayScale} width={6 / displayScale} height={6 / displayScale} fill="white" stroke={ACCENT} strokeWidth={1 / displayScale} />
+              </g>)}
+              {selectedArrow && (['tail', 'tip'] as const).map(end => { const x = selectedArrow.x + (end === 'tip' ? selectedArrow.width : 0), y = selectedArrow.y + (end === 'tip' ? selectedArrow.height : 0); return <g key={end}><circle data-endpoint={end} cx={x} cy={y} r={9 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: 'crosshair' }} /><circle cx={x} cy={y} r={4 / displayScale} fill="white" stroke={ACCENT} strokeWidth={1.5 / displayScale} /></g>; })}
+              {selectedArrow && bendHandle && <g>
+                <line x1={selectedArrow.x + selectedArrow.width / 2} y1={selectedArrow.y + selectedArrow.height / 2} x2={bendHandle.x} y2={bendHandle.y} stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={`${3 / displayScale} ${3 / displayScale}`} opacity={0.6} />
+                <circle data-bend="1" cx={bendHandle.x} cy={bendHandle.y} r={10 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: 'grab' }}><title>Drag to bend. Double-click to straighten.</title></circle>
+                <circle cx={bendHandle.x} cy={bendHandle.y} r={4 / displayScale} fill={ACCENT} stroke="white" strokeWidth={1.5 / displayScale} />
+              </g>}
+            </>}
+            {hoverBox && hovered?.type !== 'highlight' && !textEditor && <rect data-testid="hover-outline" {...hoverBox} fill="none" stroke={ACCENT} strokeWidth={1 / displayScale} opacity={0.65} />}
+            {guides.map((g, i) => <line key={i} data-testid="editor-axis-guide" x1={g.from.x} y1={g.from.y} x2={g.to.x} y2={g.to.y} stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={`${4 / displayScale} ${4 / displayScale}`} opacity={0.7} />)}
+            {marquee && <rect data-testid="selection-marquee" {...marquee} fill="rgba(98,68,224,0.10)" stroke={ACCENT} strokeWidth={1 / displayScale} />}
+            {crop && <><path d={`M 0 0 H ${size.imageWidth} V ${size.imageHeight} H 0 Z M ${crop.x} ${crop.y} V ${crop.y + crop.height} H ${crop.x + crop.width} V ${crop.y} Z`} fill="rgba(30,30,38,0.5)" fillRule="evenodd" /><rect {...crop} fill="none" stroke="white" strokeWidth={1.5 / displayScale} strokeDasharray={`${6 / displayScale} ${4 / displayScale}`} /><path d={`M ${crop.x + crop.width / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x + crop.width * 2 / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x} ${crop.y + crop.height / 3} H ${crop.x + crop.width} M ${crop.x} ${crop.y + crop.height * 2 / 3} H ${crop.x + crop.width}`} fill="none" stroke="rgba(255,255,255,.4)" strokeWidth={0.5 / displayScale} /></>}
+          </g></svg>
+          {showSelection && selection && !selectedArrow && !markerSelected && <div data-testid="selection-size" className="absolute pointer-events-none whitespace-nowrap rounded-[3px] bg-accent px-1.5 py-0.5 text-[10px] text-white" style={{ left: (size.imageX + selection.x + selection.width / 2) * displayScale, top: (size.imageY + selection.y + selection.height) * displayScale + 10, transform: 'translateX(-50%)' }}>{Math.round(selection.width)} × {Math.round(selection.height)}{selectedItems.length > 1 ? ` · ${selectedItems.length} layers` : ''}</div>}
+          {lineControls && <div role="toolbar" aria-label="Line controls" data-testid="line-controls" onPointerDown={event => event.stopPropagation()} className="absolute z-10 flex items-center gap-0.5 rounded-lg border border-line bg-white p-1 shadow-[0_3px_14px_rgba(0,0,0,.12)] cursor-default" style={{ left: Math.max(8, Math.min(size.width * displayScale - 236, selectedArrow ? (size.imageX + selectedArrow.x + selectedArrow.width / 2) * displayScale - 108 : size.width * displayScale / 2 - 108)), top: selectedArrow && selection ? Math.min(size.height * displayScale - 40, Math.max(8, (size.imageY + selection.y + selection.height) * displayScale + 24)) : 12 }}>
+            {(['straight', 'curved', 'elbow'] as const).map((value, i) => <button key={value} type="button" aria-pressed={lineStyle === value} onClick={() => changeArrow({ arrowStyle: value })} className="rounded px-2.5 py-1.5 text-[11px] text-ink-2 hover:bg-panel aria-pressed:bg-accent-soft aria-pressed:text-accent-ink">{['Straight', 'Curved', 'Bent'][i]}</button>)}
+            {lineStyle === 'elbow' && <button type="button" aria-label="Change line turn" title="Switch the corner" onClick={() => changeArrow({ arrowTurn: (selectedArrow?.arrowTurn ?? arrow.arrowTurn) === 'vertical-first' ? 'horizontal-first' : 'vertical-first' })} className="rounded px-2 py-1.5 hover:bg-panel">↳</button>}
+          </div>}
+          {textEditor && <InlineTextEditor annotation={textEditor.annotation} value={textEditor.value} isNew={textEditor.isNew} scale={displayScale} imageX={size.imageX} imageY={size.imageY} onChange={value => setTextEditor({ ...textEditor, value })} onCommit={commitText} onCancel={() => { const id = textEditor.isNew ? null : textEditor.annotation.id; setTextEditor(null); onSelect(id); onToolChange?.('select'); }} />}
+        </div> : <div className="flex flex-col items-center gap-2 text-center text-ink-3"><strong className="text-[13px] font-medium text-ink">{loadingMessage ? 'Opening your screenshot' : 'No image loaded'}</strong><span className="text-app">{loadingMessage ?? 'Drop a screenshot here, or import one from the file menu.'}</span></div>}
       </div>
+      {!textEditor && ['highlight', 'pen', 'select', 'arrow'].includes(tool) && <div className="sticky bottom-3 mx-auto w-fit max-w-[90%] pointer-events-none rounded-md bg-white/90 px-3 py-1.5 text-[10px] text-ink-2 shadow-sm" style={{ marginTop: -30 }}>{tool === 'highlight' ? 'Snap to a row · Alt to draw freely · Shift for 45°' : tool === 'pen' ? 'Draw freely · Shift for a straight stroke · Esc to cancel' : tool === 'arrow' ? 'Drag to draw · Drag the middle handle to bend' : 'Drag to select · Shift-click to add · Arrow keys to nudge'}</div>}
     </div>
   );
 }
-
 export default EditorCanvas;

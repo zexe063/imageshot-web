@@ -8,6 +8,7 @@ import ExportMenu from './components/ExportMenu';
 import { IconButton } from './components/ui';
 import { DEFAULT_STYLE, type Annotation, type ArrowEnds, type ArrowHead, type ArrowStyle, type ArrowTurn, type CompositionStyle, type Tool } from './lib/editor-types';
 import { annotationBounds, ARROW_CURVE_DEFAULT, getCompositionSize, renderComposition } from './lib/render';
+import { selectionBounds, transformAnnotation } from './lib/selection';
 import { layerDisplayName, layerLabel } from './lib/naming';
 import { captureFitScale, getCapture, listCaptures, materializeCapture, type CaptureRecord } from './lib/capture-store';
 import { readDraft, writeDraft, type ShotDocument } from './lib/document-store';
@@ -30,6 +31,25 @@ function reducedCaptureNotice(capture: CaptureRecord): string {
 }
 const initialDocument: ShotDocument = { name: 'A little more clarity', imageSrc: './sample-workspace.svg', annotations: [], style: DEFAULT_STYLE, sample: true };
 type Dialog = 'capture' | 'shortcuts' | 'recent' | null;
+
+/** How long an editor that was opened mid-capture waits for its record. */
+const PENDING_CAPTURE_TIMEOUT = 60_000;
+const PENDING_CAPTURE_INTERVAL = 60;
+
+/**
+ * The editor tab is opened while the screenshot is still being taken, so a pending id
+ * has to be waited for rather than reported as missing. The background worker closes
+ * that tab outright if the capture fails, so this only has to outlast a worker that
+ * died mid-capture.
+ */
+async function waitForCapture(id: string): Promise<CaptureRecord | undefined> {
+  const deadline = Date.now() + PENDING_CAPTURE_TIMEOUT;
+  for (;;) {
+    const capture = await getCapture(id);
+    if (capture || Date.now() > deadline) return capture;
+    await new Promise(resolve => setTimeout(resolve, PENDING_CAPTURE_INTERVAL));
+  }
+}
 
 function Modal({ title, subtitle, children, onClose }: { title: string; subtitle: string; children: ReactNode; onClose: () => void }) {
   const ref = useRef<HTMLDialogElement>(null);
@@ -56,15 +76,32 @@ function Modal({ title, subtitle, children, onClose }: { title: string; subtitle
 }
 
 export default function App() {
-  const [doc, setDoc] = useState<ShotDocument>(initialDocument);
+  const [doc, setDoc] = useState<ShotDocument>(() => {
+    const captureId = new URLSearchParams(window.location.search).get('capture');
+    return captureId ? { ...initialDocument, name: 'Screenshot', imageSrc: '', sample: false, captureId } : initialDocument;
+  });
   const docRef = useRef(doc); docRef.current = doc;
   const [image, setImage] = useState<HTMLImageElement | null>(null);
+  /** The capture image, decoded and waiting to be adopted by the load effect. */
+  const decoded = useRef<{ src: string; image: HTMLImageElement } | null>(null);
   const [ready, setReady] = useState(false);
+  const [waiting, setWaiting] = useState(() => !!new URLSearchParams(window.location.search).get('capture'));
   const [past, setPast] = useState<ShotDocument[]>([]);
   const [future, setFuture] = useState<ShotDocument[]>([]);
-  const [tool, setTool] = useState<Tool>('select');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [defaults, setDefaults] = useState({ color: '#000000', strokeWidth: 4, fontSize: 32, fill: null as string | null, radius: 3, opacity: 100, arrowStyle: 'straight' as ArrowStyle, curve: ARROW_CURVE_DEFAULT, arrowHead: 'chevron' as ArrowHead, arrowEnds: 'head' as ArrowEnds, headSize: 0, arrowTurn: 'horizontal-first' as ArrowTurn });
+  const [tool, setToolState] = useState<Tool>('select');
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const selectedId = selectedIds[selectedIds.length - 1] ?? null;
+  const setSelectedId = useCallback((id: string | null) => setSelectedIds(id ? [id] : []), []);
+  const changeSelection = useCallback((ids: string[]) => setSelectedIds([...new Set(ids)]), []);
+  const nudgeDocument = useRef<ShotDocument | null>(null);
+  const [defaults, setDefaults] = useState({ color: '#000000', strokeWidth: 4, fontSize: 32, fontFamily: 'Inter', fontWeight: 600, lineHeight: 1.3, letterSpacing: 0, align: 'left' as NonNullable<Annotation['align']>, fill: null as string | null, radius: 3, opacity: 100, arrowStyle: 'straight' as ArrowStyle, curve: ARROW_CURVE_DEFAULT, arrowHead: 'chevron' as ArrowHead, arrowEnds: 'head' as ArrowEnds, headSize: 0, arrowTurn: 'horizontal-first' as ArrowTurn });
+  const toolDefaults = useRef(new Map<Tool, typeof defaults>());
+  function setTool(next: Tool) {
+    if (next === tool) return;
+    if (tool !== 'select' && tool !== 'crop') toolDefaults.current.set(tool, defaults);
+    if (next !== 'select' && next !== 'crop') setDefaults(toolDefaults.current.get(next) ?? { ...defaults, color: next === 'highlight' ? '#FFE45E' : '#000000', strokeWidth: 4 });
+    setToolState(next);
+  }
   const [zoom, setZoom] = useState(1);
   const [actualZoom, setActualZoom] = useState(1);
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -83,6 +120,13 @@ export default function App() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const selected = doc.annotations.find(a => a.id === selectedId) ?? null;
+  const selectedLayers = doc.annotations.filter(annotation => selectedIds.includes(annotation.id));
+  const editableLayers = selectedLayers.filter(annotation => !annotation.locked && !annotation.hidden);
+  const selectedBounds = selectionBounds(editableLayers) ?? (selected ? annotationBounds(selected) : null);
+  useEffect(() => {
+    const ids = new Set(doc.annotations.map(annotation => annotation.id));
+    setSelectedIds(current => current.every(id => ids.has(id)) ? current : current.filter(id => ids.has(id)));
+  }, [doc.annotations]);
   const size = useMemo(() => (image ? getCompositionSize(image, doc.style) : { width: 0, height: 0 }), [image, doc.style]);
   const selectedIndex = useMemo(() => {
     if (!selected) return 1;
@@ -96,7 +140,7 @@ export default function App() {
   }, [doc.annotations, selected]);
   // With nothing selected the panel is describing the tool in hand, not the image, so
   // the header has to name that tool rather than fall back to the screenshot.
-  const selectedName = selected ? layerDisplayName(selected, selectedIndex) : tool === 'select' || tool === 'crop' ? 'Screenshot' : layerLabel(tool);
+  const selectedName = selectedLayers.length > 1 ? `${selectedLayers.length} layers` : selected ? layerDisplayName(selected, selectedIndex) : tool === 'select' || tool === 'crop' ? 'Screenshot' : layerLabel(tool);
 
   /** Steps the on-screen scale by whole percentage points (5% per click). */
   const zoomBy = useCallback((delta: number) => {
@@ -114,6 +158,7 @@ export default function App() {
   }, []);
 
   const commit = useCallback((change: Partial<ShotDocument> | ((d: ShotDocument) => ShotDocument)) => {
+    nudgeDocument.current = null;
     const current = docRef.current;
     const next = typeof change === 'function' ? change(current) : { ...current, ...change };
     if (next === current) return;
@@ -147,63 +192,57 @@ export default function App() {
     commit(d => ({ ...d, annotations: d.annotations.map(a => (a.id === id ? { ...a, ...change } : a)) }));
   }
   function deleteSelected() {
-    if (!selected || selected.locked) return;
-    commit(d => ({ ...d, annotations: d.annotations.filter(a => a.id !== selectedId) }));
-    setSelectedId(null);
+    const ids = new Set(editableLayers.map(annotation => annotation.id));
+    if (!ids.size) return;
+    commit(d => ({ ...d, annotations: d.annotations.filter(a => !ids.has(a.id)) }));
+    setSelectedIds(current => current.filter(id => !ids.has(id)));
   }
   function duplicateSelected() {
-    if (!selected) return;
-    const copy = { ...selected, id: crypto.randomUUID(), x: selected.x + 20, y: selected.y + 20, locked: false };
-    commit(d => ({ ...d, annotations: [...d.annotations, copy] }));
-    setSelectedId(copy.id);
+    if (!editableLayers.length) return;
+    const copies = editableLayers.map(annotation => ({ ...annotation, id: crypto.randomUUID(), x: annotation.x + 20, y: annotation.y + 20 }));
+    commit(d => ({ ...d, annotations: [...d.annotations, ...copies] }));
+    setSelectedIds(copies.map(annotation => annotation.id));
   }
-  /** Applies a bounding box, keeping each layer type's geometry consistent. */
-  function applyBox(id: string, box: { x: number; y: number; width: number; height: number }, extra?: Partial<Annotation>) {
-    commit(d => ({
-      ...d,
-      annotations: d.annotations.map(annotation => {
-        if (annotation.id !== id) return annotation;
-        const current = annotationBounds(annotation);
-        if (annotation.type === 'arrow') {
-          return { ...annotation, x: annotation.x + (box.x - current.x), y: annotation.y + (box.y - current.y) };
-        }
-        if (annotation.type === 'text') {
-          const factor = box.width / (current.width || 1);
-          return { ...annotation, x: box.x, y: box.y, fontSize: Math.max(8, Math.round((annotation.fontSize || 28) * factor)) };
-        }
-        if (annotation.type === 'number') {
-          const side = Math.max(20, box.width, box.height);
-          return { ...annotation, x: box.x, y: box.y, width: side, height: side };
-        }
-        return {
-          ...annotation,
-          ...extra,
-          x: box.x,
-          y: box.y,
-          width: box.width,
-          height: box.height,
-          points: annotation.points?.map(point => ({ x: point.x * (box.width / (current.width || 1)), y: point.y * (box.height / (current.height || 1)) })),
-        };
-      }),
-    }));
+  function nudgeSelected(key: string, distance: number, repeat: boolean) {
+    const ids = new Set(editableLayers.map(annotation => annotation.id));
+    if (!ids.size) return;
+    const dx = key === 'ArrowLeft' ? -distance : key === 'ArrowRight' ? distance : 0;
+    const dy = key === 'ArrowUp' ? -distance : key === 'ArrowDown' ? distance : 0;
+    const current = docRef.current;
+    const next = { ...current, annotations: current.annotations.map(annotation => ids.has(annotation.id) ? { ...annotation, x: annotation.x + dx, y: annotation.y + dy } : annotation) };
+    // Holding a key is one gesture, with a single undo for the entire selection.
+    if (repeat && nudgeDocument.current === current) { docRef.current = next; setDoc(next); }
+    else commit(next);
+    nudgeDocument.current = next;
   }
   function patchLayer(patch: Partial<Annotation>) {
-    if (!selected) return;
-    const boxKeys = ['width', 'height'] as const;
-    if (boxKeys.some(key => key in patch)) {
-      const current = annotationBounds(selected);
-      // A text box is measured, so a caller that also carries typography (the
-      // inspector) must not lose it to the box branch.
-      const rest = Object.fromEntries(Object.entries(patch).filter(([key]) => !boxKeys.includes(key as (typeof boxKeys)[number])));
-      applyBox(selected.id, {
-        x: current.x,
-        y: current.y,
-        width: Math.max(1, patch.width ?? current.width),
-        height: Math.max(1, patch.height ?? current.height),
-      }, rest as Partial<Annotation>);
-      return;
+    const ids = new Set(editableLayers.map(annotation => annotation.id));
+    if (!ids.size) return;
+    if (selected && !['x', 'y', 'width', 'height', 'text'].some(key => key in patch)) {
+      const nextDefaults = { ...(toolDefaults.current.get(selected.type) ?? defaults), ...patch } as typeof defaults;
+      toolDefaults.current.set(selected.type, nextDefaults);
+      if (tool === selected.type) setDefaults(nextDefaults);
     }
-    updateAnnotation(selected.id, patch);
+    const boxKeys = ['x', 'y', 'width', 'height'];
+    const geometryChanged = boxKeys.some(key => key in patch);
+    commit(d => {
+      const current = selectionBounds(d.annotations.filter(annotation => ids.has(annotation.id)));
+      if (!current) return d;
+      const box = { x: patch.x ?? current.x, y: patch.y ?? current.y, width: Math.max(1, patch.width ?? current.width), height: Math.max(1, patch.height ?? current.height) };
+      return { ...d, annotations: d.annotations.map(annotation => {
+        if (!ids.has(annotation.id)) return annotation;
+        const compatible = Object.fromEntries(Object.entries(patch).filter(([key]) => {
+          if (boxKeys.includes(key)) return false;
+          if (['fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'letterSpacing', 'align', 'text'].includes(key)) return annotation.type === 'text';
+          if (['arrowStyle', 'curve', 'arrowHead', 'arrowEnds', 'headSize', 'arrowTurn'].includes(key)) return annotation.type === 'arrow';
+          if (key === 'fill') return annotation.type === 'rectangle' || annotation.type === 'ellipse';
+          if (key === 'radius') return annotation.type === 'rectangle';
+          return ['color', 'strokeColor', 'strokeWidth', 'opacity'].includes(key);
+        }));
+        const transformed = geometryChanged ? transformAnnotation(annotation, current, box) : annotation;
+        return { ...transformed, ...compatible };
+      }) };
+    });
   }
 
   /**
@@ -219,14 +258,33 @@ export default function App() {
     let live = true;
     (async () => {
       try {
-        const id = new URLSearchParams(window.location.search).get('capture');
+        const params = new URLSearchParams(window.location.search);
+        const id = params.get('capture');
         if (id) {
-          const draft = await readDraft(`capture:${id}`);
-          if (draft) { if (live) setDoc({ ...draft, style: { ...DEFAULT_STYLE, ...draft.style } }); return; }
-          const capture = await getCapture(id);
+          const pending = params.get('pending') === '1';
+          if (pending && live) {
+            // Show an empty artboard straight away rather than the sample image, and
+            // say why, so the tab is ready to receive the capture it was opened for.
+            setDoc({ ...initialDocument, name: 'Screenshot', imageSrc: '', sample: false, captureId: id });
+            setWaiting(true);
+          }
+          const [draft, capture] = await Promise.all([readDraft(`capture:${id}`), pending ? waitForCapture(id) : getCapture(id)]);
+          if (!live) return;
+          // A draft taken from a capture keeps no image of its own, so it is rebuilt
+          // from the capture record and only the annotations and style are reused.
+          if (draft && (draft.imageSrc || !draft.captureId)) { if (live) setDoc({ ...draft, style: { ...DEFAULT_STYLE, ...draft.style } }); return; }
           if (!capture) throw new Error('This capture is no longer available. Import an image or take a new screenshot.');
-          const dataUrl = await materializeCapture(capture);
-          if (live) setDoc({ ...initialDocument, name: capture.name, imageSrc: dataUrl, sample: false, captureId: id });
+          const { src, image: composed } = await materializeCapture(capture);
+          if (!live) { URL.revokeObjectURL(src); return; }
+          decoded.current = { src, image: composed };
+          if (live) setDoc({
+            ...initialDocument,
+            name: capture.name,
+            imageSrc: src,
+            sample: false,
+            captureId: id,
+            ...(draft ? { annotations: draft.annotations, style: { ...DEFAULT_STYLE, ...draft.style } } : {}),
+          });
           const reduced = reducedCaptureNotice(capture);
           if (live && reduced) notify(reduced);
         } else {
@@ -236,7 +294,7 @@ export default function App() {
       } catch (error) {
         if (live) notify(error instanceof Error ? error.message : 'Could not load the previous capture.');
       } finally {
-        if (live) setReady(true);
+        if (live) { setWaiting(false); setReady(true); }
       }
     })();
     return () => { live = false; };
@@ -244,10 +302,19 @@ export default function App() {
 
   useEffect(() => {
     let live = true;
+    if (!doc.imageSrc) { setImage(null); return; }
+    // A capture arrives already decoded, so hand that one over rather than parsing the
+    // same multi-megabyte image a second time.
+    const preloaded = decoded.current;
+    if (preloaded && preloaded.src === doc.imageSrc) { decoded.current = null; setImage(preloaded.image); return; }
     const next = new Image();
-    next.onload = () => { if (live) setImage(next); };
-    next.onerror = () => { if (live) { setImage(null); notify('This image could not be opened. Try a PNG, JPG, or WebP.'); } };
     next.src = doc.imageSrc;
+    // decode() settles on the decoded bitmap, a frame or two sooner than load, which
+    // is the difference between seeing the screenshot and seeing it on a long page.
+    next.decode().then(
+      () => { if (live) setImage(next); },
+      () => { if (live) { setImage(null); notify('This image could not be opened. Try a PNG, JPG, or WebP.'); } },
+    );
     return () => { live = false; };
   }, [doc.imageSrc, notify]);
 
@@ -285,14 +352,21 @@ export default function App() {
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
-      if ((event.target as HTMLElement)?.closest('input,textarea,select,[contenteditable="true"]') || dialog) return;
+      const target = event.target as HTMLElement | null;
+      if (event.defaultPrevented || target?.isContentEditable || target?.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])') || dialog) return;
       const mod = event.ctrlKey || event.metaKey;
+      if (mod && event.key.toLowerCase() === 'a') { event.preventDefault(); setSelectedIds(doc.annotations.filter(annotation => !annotation.hidden && !annotation.locked).map(annotation => annotation.id)); setTool('select'); return; }
       if (mod && event.key.toLowerCase() === 'z') { event.preventDefault(); event.shiftKey ? redo() : undo(); return; }
       if (mod && event.key.toLowerCase() === 'y') { event.preventDefault(); redo(); return; }
       if (mod && event.key.toLowerCase() === 's') { event.preventDefault(); setExportOpen(value => !value); return; }
       if (mod && event.key.toLowerCase() === 'd') { event.preventDefault(); duplicateSelected(); return; }
       if (mod && event.key.toLowerCase() === 'o') { event.preventDefault(); fileInput.current?.click(); return; }
       if (mod) return;
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key) && editableLayers.length) {
+        event.preventDefault();
+        nudgeSelected(event.key, event.shiftKey ? 10 : 1, event.repeat);
+        return;
+      }
       if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); deleteSelected(); }
       if (event.key === 'Escape') { setTool('select'); setSelectedId(null); setMenuOpen(false); setExportOpen(false); }
       // Shift with a tool key takes the shortcut further: on Line it cycles the arrow
@@ -316,14 +390,18 @@ export default function App() {
         return;
       }
       const match = TOOLS.find(tool => tool.key.toLowerCase() === event.key.toLowerCase());
-      if (match) { event.preventDefault(); setTool(match.id); }
+      if (match) { event.preventDefault(); if (match.id !== 'select') setSelectedId(null); setTool(match.id); }
       if (event.key === '0') setZoom(1);
       if (event.key === '+' || event.key === '=') zoomBy(0.05);
       if (event.key === '-') zoomBy(-0.05);
       if (event.key === '?') setDialog('shortcuts');
     }
+    function endNudge(event: KeyboardEvent) {
+      if (event.key.startsWith('Arrow')) nudgeDocument.current = null;
+    }
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keyup', endNudge);
+    return () => { window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', endNudge); };
   });
 
   async function importFile(file?: File) {
@@ -415,8 +493,9 @@ export default function App() {
   async function openRecent(capture: CaptureRecord) {
     try {
       const saved = await readDraft(`capture:${capture.id}`);
-      const imageSrc = saved?.imageSrc || await materializeCapture(capture);
-      commit(saved ? { ...saved, style: { ...DEFAULT_STYLE, ...saved.style } } : { imageSrc, name: capture.name, annotations: [], style: DEFAULT_STYLE, sample: false, captureId: capture.id });
+      // A saved draft may hold no image, because a capture's is rebuilt on open.
+      const imageSrc = saved?.imageSrc || (await materializeCapture(capture)).src;
+      commit(saved ? { ...saved, imageSrc, style: { ...DEFAULT_STYLE, ...saved.style } } : { imageSrc, name: capture.name, annotations: [], style: DEFAULT_STYLE, sample: false, captureId: capture.id });
       const reduced = reducedCaptureNotice(capture);
       if (reduced) notify(reduced);
       setDialog(null);
@@ -465,7 +544,7 @@ export default function App() {
         onRecent={() => { setDialog('recent'); setMenuOpen(false); }}
         onSample={() => { commit(initialDocument); setMenuOpen(false); setZoom(1); }}
         onShortcuts={() => { setDialog('shortcuts'); setMenuOpen(false); }}
-        onTool={setTool}
+        onTool={next => { if (next !== 'select') setSelectedId(null); setTool(next); }}
         zoom={zoom}
         actualZoom={actualZoom}
         onZoomIn={() => zoomBy(0.05)}
@@ -497,7 +576,9 @@ export default function App() {
         <LayersPanel
           annotations={doc.annotations}
           selectedId={selectedId}
+          selectedIds={selectedIds}
           onSelect={id => { setSelectedId(id); setTool('select'); }}
+          onSelectionChange={ids => { changeSelection(ids); setTool('select'); }}
           onToggleHidden={annotation => updateAnnotation(annotation.id, { hidden: !annotation.hidden })}
           onToggleLock={annotation => updateAnnotation(annotation.id, { locked: !annotation.locked })}
           onReorder={reorderLayer}
@@ -513,18 +594,23 @@ export default function App() {
               annotations={doc.annotations}
               onChange={annotations => commit({ annotations })}
               selectedId={selectedId}
+              selectedIds={selectedIds}
               onSelect={setSelectedId}
+              onSelectionChange={changeSelection}
               tool={tool}
               color={defaults.color}
               strokeWidth={defaults.strokeWidth}
               arrow={defaults}
+              onArrowChange={sendArrow}
               textSize={defaults.fontSize}
+              textStyle={defaults}
               style={doc.style}
               zoom={zoom}
               onToolChange={setTool}
               onZoomChange={setActualZoom}
               onCrop={(imageSrc, annotations) => { commit({ imageSrc, annotations }); setZoom(1); notify('Image cropped. Undo restores the original.'); }}
               onStatus={notify}
+              loadingMessage={waiting ? 'Finishing your screenshot…' : undefined}
             />
           </div>
         </main>
@@ -533,7 +619,7 @@ export default function App() {
           selected={selected}
           selectedName={selectedName}
           style={doc.style}
-          bounds={selected ? annotationBounds(selected) : null}
+          bounds={selectedBounds}
           tool={tool}
           defaults={defaults}
           onStyle={changeStyle}
@@ -574,7 +660,7 @@ export default function App() {
                 <kbd className="font-ui text-[10px] font-[450] px-1 py-0.5 rounded-[4px] whitespace-nowrap bg-field text-ink-2 shadow-[inset_0_0_0_1px_rgba(0,0,0,.05)]">{tool.key}</kbd>
               </div>
             ))}
-            {[['Cycle arrow body', 'Shift A'], ['Bend arrow', '[  ]'], ['Undo', 'Ctrl Z'], ['Redo', 'Ctrl Shift Z'], ['Export', 'Ctrl S'], ['Import image', 'Ctrl O'], ['Duplicate layer', 'Ctrl D'], ['Delete layer', 'Delete'], ['Fit canvas', '0']].map(([label, keys]) => (
+            {[['Select multiple layers', 'Shift click / drag'], ['Select all unlocked layers', 'Ctrl A'], ['Nudge selection', 'Arrow keys'], ['Nudge by 10 px', 'Shift Arrow'], ['Cycle arrow body', 'Shift A'], ['Bend arrow on canvas', 'Drag center handle'], ['Adjust arrow bend', '[  ]'], ['Highlight a text row', 'Drag to snap'], ['Freehand highlighter', 'Alt drag'], ['Undo', 'Ctrl Z'], ['Redo', 'Ctrl Shift Z'], ['Export', 'Ctrl S'], ['Import image', 'Ctrl O'], ['Duplicate selection', 'Ctrl D'], ['Delete selection', 'Delete'], ['Fit canvas', '0']].map(([label, keys]) => (
               <div key={label} className="flex items-center justify-between h-7 px-2 rounded-[5px] odd:bg-panel"><span>{label}</span><kbd className="font-ui text-[10px] font-[450] px-1 py-0.5 rounded-[4px] whitespace-nowrap bg-field text-ink-2 shadow-[inset_0_0_0_1px_rgba(0,0,0,.05)]">{keys}</kbd></div>
             ))}
           </div>
