@@ -306,7 +306,22 @@ async function movePageCapture(x: number, y: number, hideFixed: boolean): Promis
   if (!state) throw new Error('Capture timed out. Please try a smaller area.')
   if (state.cancelled) throw new Error('Capture cancelled.')
   if (hideFixed) for (const element of state.fixed) element.style.setProperty('visibility', 'hidden', 'important')
-  window.scrollTo({ left: x, top: y, behavior: 'instant' })
+  // Document may not scroll — inner scroller might. Try both.
+  const tryScroll = (tx: number, ty: number) => {
+    window.scrollTo({ left: tx, top: ty, behavior: 'instant' })
+    if (Math.abs(window.scrollX - tx) > 1 || Math.abs(window.scrollY - ty) > 1) window.scrollTo({ left: tx, top: ty, behavior: 'instant' })
+    let sx = tx - window.scrollX, sy = ty - window.scrollY
+    if (Math.abs(sx) > 1 || Math.abs(sy) > 1) {
+      for (const el of document.querySelectorAll<HTMLElement>('body, body *')) {
+        if (Math.abs(sx) <= 1 && Math.abs(sy) <= 1) break
+        const st = getComputedStyle(el)
+        if (!/(auto|scroll|overlay)/.test(`${st.overflow} ${st.overflowX} ${st.overflowY}`)) continue
+        if (Math.abs(sy) > 1 && el.scrollHeight > el.clientHeight + 1) { const b = el.scrollTop; el.scrollTop = b + sy; sy -= el.scrollTop - b }
+        if (Math.abs(sx) > 1 && el.scrollWidth > el.clientWidth + 1) { const b = el.scrollLeft; el.scrollLeft = b + sx; sx -= el.scrollLeft - b }
+      }
+    }
+  }
+  tryScroll(x, y)
   await new Promise<void>((resolve) => {
     const fallback = setTimeout(resolve, 120)
     requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(fallback); resolve() }))
@@ -371,16 +386,27 @@ async function captureFullPage(tab: chrome.tabs.Tab & { id: number }, id: string
         totalBytes += dataUrl.length * 0.75
         if (totalBytes > MAX_ENCODED_BYTES) throw new Error('This image-heavy page is too large to capture at once. Choose a smaller area instead.')
         const pieceWidth = Math.min(initial.viewportWidth, width - x)
-        const sourceX = Math.round((x - metrics.scrollX) * scaleX)
-        const sourceY = Math.round((y - metrics.scrollY) * scaleY)
-        const tileX = Math.round(x * scaleX)
-        const tileY = Math.round(y * scaleY)
-        const tileWidth = Math.round((x + pieceWidth) * scaleX) - tileX
-        const tileHeight = Math.round((y + rowHeight) * scaleY) - tileY
-        if (sourceX < -1 || sourceY < -1 || sourceX + tileWidth > bitmap.width + 1 || sourceY + tileHeight > bitmap.height + 1) {
-          throw new Error('This page uses a scrolling layout that cannot be stitched reliably. Use Visible page or Area instead.')
+        // Slot = where this row belongs in the finished image. Source = where it is in the frame we just shot.
+        // They differ when the page didn't scroll exactly as asked — clip & stitch, don't bail.
+        const slotX = Math.round(x * scaleX)
+        const slotY = Math.round(y * scaleY)
+        const slotW = Math.round((x + pieceWidth) * scaleX) - slotX
+        const slotH = Math.round((y + rowHeight) * scaleY) - slotY
+        const rawSX = Math.round((x - metrics.scrollX) * scaleX)
+        const rawSY = Math.round((y - metrics.scrollY) * scaleY)
+        const left = Math.max(0, Math.min(bitmap.width, rawSX))
+        const top = Math.max(0, Math.min(bitmap.height, rawSY))
+        const right = Math.max(left, Math.min(bitmap.width, rawSX + slotW))
+        const bottom = Math.max(top, Math.min(bitmap.height, rawSY + slotH))
+        const w = Math.min(slotW, right - left), h = Math.min(slotH, bottom - top)
+        if (w > 0 && h > 0) {
+          tiles.push({
+            dataUrl,
+            sourceX: left, sourceY: top, sourceWidth: w, sourceHeight: h,
+            x: slotX + Math.max(0, left - rawSX), y: slotY + Math.max(0, top - rawSY),
+            width: w, height: h,
+          })
         }
-        tiles.push({ dataUrl, sourceX: Math.max(0, sourceX), sourceY: Math.max(0, sourceY), sourceWidth: Math.min(tileWidth, bitmap.width - Math.max(0, sourceX)), sourceHeight: Math.min(tileHeight, bitmap.height - Math.max(0, sourceY)), x: tileX, y: tileY, width: tileWidth, height: tileHeight })
       }
       y += rowHeight
       // Re-check after capture: lazy content may extend the document while the
@@ -706,11 +732,41 @@ function editorUrl(id: string, pending: boolean): string {
   return chrome.runtime.getURL(`editor.html?${query}`)
 }
 
+async function performCapture(mode: CaptureMode): Promise<string> {
+  if (capturing) throw new Error('A capture is already in progress. Finish it or press Escape on the page.')
+  capturing = true
+  let tabId: number | undefined
+  let editorTabId: number | undefined
+  let stored = false
+  try {
+    const tab = await activeCaptureTab()
+    tabId = tab.id
+    const id = crypto.randomUUID()
+    const destination = await readCaptureDestination()
+    if (destination === 'studio') {
+      try { editorTabId = (await chrome.tabs.create({ url: editorUrl(id, true), active: false })).id } catch { editorTabId = undefined }
+    }
+    const record = mode === 'area' ? await captureArea(tab, id) : mode === 'full' ? await captureFullPage(tab, id) : await captureVisible(tab, id)
+    await saveCapture(record)
+    stored = true
+    if (destination === 'panel') {
+      await openCapturePanel(tab.id, record)
+    } else {
+      if (editorTabId === undefined) editorTabId = (await chrome.tabs.create({ url: editorUrl(id, false) })).id
+      else try { await chrome.tabs.update(editorTabId, { active: true }) } catch {}
+    }
+    return id
+  } catch (error) {
+    const msg = readableError(error)
+    if (tabId && msg !== 'Capture cancelled.') await showCaptureError(tabId, msg)
+    if (editorTabId !== undefined && !stored) try { await chrome.tabs.remove(editorTabId) } catch {}
+    throw new Error(msg)
+  } finally { capturing = false }
+}
+
 chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
   if (!message || typeof message !== 'object' || !('type' in message)) return false
   if (sender.id !== chrome.runtime.id) return false
-  // The in-page panel asks for the editor only when somebody actually wants it, so
-  // there is no tab to open and no capture to tear down on the way there.
   if (message.type === 'IMAGESHOT_OPEN_STUDIO') {
     const id = 'id' in message ? message.id : undefined
     if (typeof id !== 'string') return false
@@ -723,64 +779,13 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
     sendResponse({ ok: false, error: 'Choose an area, visible page, or full page capture.' })
     return false
   }
-  if (capturing) {
-    sendResponse({ ok: false, error: 'A capture is already in progress. Finish it or press Escape on the page.' })
-    return false
-  }
-  capturing = true
-  let tabId: number | undefined
-  let editorTabId: number | undefined
-  let stored = false
-  void (async () => {
-    try {
-      const tab = await activeCaptureTab()
-      tabId = tab.id
-      const id = crypto.randomUUID()
-      const destination = await readCaptureDestination()
-      // Opening the editor in the background first and only focusing it once the
-      // pixels exist lets the tab and the app boot alongside the capture. A new tab
-      // does not take the active tab, so the page being captured stays visible.
-      if (destination === 'studio') {
-        try {
-          editorTabId = (await chrome.tabs.create({ url: editorUrl(id, true), active: false })).id
-        } catch {
-          // Fall back to opening the editor the slow way, once the capture is done.
-          editorTabId = undefined
-        }
-      }
-      const record = mode === 'area' ? await captureArea(tab, id) : mode === 'full' ? await captureFullPage(tab, id) : await captureVisible(tab, id)
-      await saveCapture(record)
-      stored = true
-      if (destination === 'panel') {
-        await openCapturePanel(tab.id, record)
-        sendResponse({ ok: true, id })
-      } else {
-        if (editorTabId === undefined) editorTabId = (await chrome.tabs.create({ url: editorUrl(id, false) })).id
-        else {
-          try {
-            await chrome.tabs.update(editorTabId, { active: true })
-          } catch {
-            // The screenshot is safe either way; the user can pick the tab up themselves.
-          }
-        }
-        sendResponse({ ok: true, id })
-      }
-    } catch (error) {
-      const message = readableError(error)
-      if (tabId && message !== 'Capture cancelled.') await showCaptureError(tabId, message)
-      // A capture that never produced pixels has to take the early editor back down
-      // rather than leave it waiting on a record that will not be written.
-      if (editorTabId !== undefined && !stored) {
-        try {
-          await chrome.tabs.remove(editorTabId)
-        } catch {
-          // The user may have closed the tab themselves.
-        }
-      }
-      sendResponse({ ok: false, error: message })
-    } finally {
-      capturing = false
-    }
-  })()
+  void performCapture(mode as CaptureMode).then(id => sendResponse({ ok: true, id })).catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }))
   return true
+})
+
+// Keyboard shortcuts from manifest (Alt+Shift+A / Alt+Shift+F) — full page now truly scrolls the whole site
+chrome.commands?.onCommand?.addListener((command) => {
+  const mode: CaptureMode | null = command === 'capture-full' ? 'full' : command === 'capture-display' ? 'visible' : null
+  if (!mode) return
+  void performCapture(mode).catch(()=>{})
 })

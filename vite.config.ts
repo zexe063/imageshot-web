@@ -12,6 +12,7 @@ export default defineConfig({
         index: resolve(import.meta.dirname, 'index.html'),
         editor: resolve(import.meta.dirname, 'editor.html'),
         popup: resolve(import.meta.dirname, 'popup.html'),
+        setting: resolve(import.meta.dirname, 'setting.html'),
         background: resolve(import.meta.dirname, 'src/extension/background.ts'),
       },
       output: {

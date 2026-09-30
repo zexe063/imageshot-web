@@ -20,6 +20,6 @@ export function layerDisplayName(annotation: Annotation, index = 1) {
   if (annotation.type === 'text') return (annotation.text || 'Text').slice(0, 24) || 'Text';
   if (annotation.type === 'number') return `Step ${annotation.number || 1}`;
   if (annotation.type === 'arrow' && annotation.arrowStyle === 'curved') return `Curved line ${index}`;
-  if (annotation.type === 'arrow' && annotation.arrowStyle === 'elbow') return `Bent line ${index}`;
+
   return `${layerLabel(annotation.type)} ${index}`;
 }

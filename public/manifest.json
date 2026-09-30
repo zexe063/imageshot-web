@@ -6,10 +6,19 @@
   "description": "Capture an area, the visible page, or the full page. Annotate and export screenshots, entirely on your device.",
   "minimum_chrome_version": "114",
   "permissions": ["activeTab", "scripting", "storage"],
+  "options_page": "setting.html",
   "commands": {
     "_execute_action": {
       "suggested_key": { "default": "Alt+Shift+S" },
       "description": "Open ImageShot capture"
+    },
+    "capture-display": {
+      "suggested_key": { "default": "Alt+Shift+A" },
+      "description": "Capture visible page"
+    },
+    "capture-full": {
+      "suggested_key": { "default": "Alt+Shift+F" },
+      "description": "Capture full page"
     }
   },
   "background": {

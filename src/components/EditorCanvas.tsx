@@ -232,8 +232,10 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
       setDrafts(gesture.base.map(a => transformAnnotation(a, gesture.bounds!, next)));
     } else if (gesture.mode === 'bend') {
       if (!gesture.moved) return;
-      const curved = { ...base, arrowStyle: base.arrowStyle === 'elbow' ? 'elbow' as const : 'curved' as const }, curve = arrowCurveAt({ ...base, arrowStyle: base.arrowStyle === 'elbow' ? 'elbow' : 'curved' }, point);
-      setDrafts([{ ...curved, curve, arrowStyle: curved.arrowStyle === 'curved' && Math.abs(curve) < 0.015 ? 'straight' : curved.arrowStyle }]);
+      // Dragging the middle handle off the chord bows the line, exactly as CleanShot
+      // does. A bow too small to see is a straight line again.
+      const curve = arrowCurveAt({ ...base, arrowStyle: 'curved' }, point);
+      setDrafts([{ ...base, arrowStyle: Math.abs(curve) < 0.02 ? 'straight' : 'curved', curve }]);
     } else if (gesture.mode === 'endpoint') {
       const fixed = gesture.endpoint === 'tail' ? { x: base.x + base.width, y: base.y + base.height } : { x: base.x, y: base.y }, tip = event.shiftKey ? snapAngle(fixed, point) : point;
       setDrafts([gesture.endpoint === 'tail' ? { ...base, x: tip.x, y: tip.y, width: fixed.x - tip.x, height: fixed.y - tip.y } : { ...base, width: tip.x - base.x, height: tip.y - base.y }]);
@@ -255,7 +257,14 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
       setDrafts([tracedAnnotation(base, path)]);
     } else {
       let width = dx, height = dy;
-      if (event.shiftKey && ['rectangle', 'ellipse'].includes(base.type)) { const side = Math.max(Math.abs(dx), Math.abs(dy)); width = side * (dx < 0 ? -1 : 1); height = side * (dy < 0 ? -1 : 1); }
+      // Figma-style: Shift = square/circle, Alt = draw from center
+      const isShape = ['rectangle', 'ellipse'].includes(base.type);
+      if (isShape && event.shiftKey) { const side = Math.max(Math.abs(dx), Math.abs(dy)); width = side * (dx < 0 ? -1 : 1); height = side * (dy < 0 ? -1 : 1); }
+      if (event.altKey && isShape) {
+        const ax = gesture.start.x - width, ay = gesture.start.y - height;
+        setDrafts([{ ...base, x: ax, y: ay, width: width * 2, height: height * 2 }]);
+        return;
+      }
       if (event.shiftKey && base.type === 'arrow') { const tip = snapAngle(gesture.start, point); width = tip.x - base.x; height = tip.y - base.y; }
       setDrafts([{ ...base, width, height }]);
     }
@@ -281,6 +290,12 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
     // Stroke bounds include ink thickness; copying them into x/y shifts every point.
     const normalized = completed.map(a => ['rectangle', 'ellipse', 'blur'].includes(a.type) ? { ...a, ...annotationBounds(a) } : a), replacements = new Map(normalized.map(a => [a.id, a]));
     onChange(gesture.mode === 'draw' ? [...annotations, ...normalized] : annotations.map(a => replacements.get(a.id) || a));
+    // Professional behaviour (Figma / CleanShot): after placing a shape/arrow, return to Select
+    // so the next drag moves the new layer instead of drawing another one. Pen/highlight stay
+    // active for continuous strokes.
+    if (gesture.mode === 'draw' && ['rectangle', 'ellipse', 'arrow', 'blur', 'text'].includes(completed[0].type)) {
+      onToolChange?.('select');
+    }
   };
   const selectedItems = visibleAnnotations.filter(a => ids.includes(a.id) && !a.hidden), selected = selectedItems.length === 1 ? selectedItems[0] : undefined;
   const selection = selectionBounds(selectedItems), locked = selectedItems.some(a => a.locked), drawing = gestureRef.current?.mode === 'draw';
@@ -288,14 +303,19 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
   const canResize = !selectedItems.some(a => a.type === 'highlight');
   const showSelection = selection && !textEditor && !crop && !drawing && !marquee;
   const hovered = !gestureRef.current && !ids.includes(hoveredId || '') ? annotations.find(a => a.id === hoveredId && !a.hidden) : undefined, hoverBox = hovered ? annotationBounds(hovered) : null;
+  // Only the four corners resize. The mid-edge handles are gone, so a shape is
+  // resized from a corner the way CleanShot does it.
   const handlePositions: { key: Handle; x: number; y: number }[] = selection ? [
-    { key: 'nw', x: selection.x, y: selection.y }, { key: 'n', x: selection.x + selection.width / 2, y: selection.y }, { key: 'ne', x: selection.x + selection.width, y: selection.y }, { key: 'e', x: selection.x + selection.width, y: selection.y + selection.height / 2 },
-    { key: 'se', x: selection.x + selection.width, y: selection.y + selection.height }, { key: 's', x: selection.x + selection.width / 2, y: selection.y + selection.height }, { key: 'sw', x: selection.x, y: selection.y + selection.height }, { key: 'w', x: selection.x, y: selection.y + selection.height / 2 },
+    { key: 'nw', x: selection.x, y: selection.y },
+    { key: 'ne', x: selection.x + selection.width, y: selection.y },
+    { key: 'se', x: selection.x + selection.width, y: selection.y + selection.height },
+    { key: 'sw', x: selection.x, y: selection.y + selection.height },
   ] : [];
   const selectedArrow = selected?.type === 'arrow' && !locked ? selected : undefined;
-  const bendHandle = selectedArrow ? (selectedArrow.arrowStyle || 'straight') === 'straight' ? { x: selectedArrow.x + selectedArrow.width / 2, y: selectedArrow.y + selectedArrow.height / 2 } : arrowBendPoint(selectedArrow) : null;
-  const lineControls = !textEditor && !gestureRef.current && (selectedArrow || (tool === 'arrow' && !selectedItems.length)), lineStyle = selectedArrow?.arrowStyle ?? arrow.arrowStyle;
-  const changeArrow = (patch: Partial<Annotation>) => { if (onArrowChange) onArrowChange(patch); else if (selectedArrow) onChange(annotations.map(a => a.id === selectedArrow.id ? { ...a, ...patch } : a)); };
+  const arrowTail = selectedArrow ? { x: selectedArrow.x, y: selectedArrow.y } : null;
+  const arrowTip = selectedArrow ? { x: selectedArrow.x + selectedArrow.width, y: selectedArrow.y + selectedArrow.height } : null;
+  const bendHandle = selectedArrow ? arrowBendPoint(selectedArrow) : null;
+  const chordMid = selectedArrow ? { x: (selectedArrow.x + selectedArrow.x + selectedArrow.width) / 2, y: (selectedArrow.y + selectedArrow.y + selectedArrow.height) / 2 } : null;
   const overlay: CSSProperties = { position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'visible', pointerEvents: 'none' };
   const cursor = tool === 'select' ? gestureRef.current ? 'grabbing' : hoveredId ? 'move' : 'default' : tool === 'text' ? 'text' : 'crosshair';
   return (
@@ -304,7 +324,12 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
         {image && size ? <div ref={artboardRef} data-testid="editor-artboard" className="relative shrink-0 touch-none select-none" role="application" aria-label="Screenshot canvas. Drag to draw, select a layer, or drag empty space to select several layers."
           onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={cancelGesture} onLostPointerCapture={() => { if (gestureRef.current) cancelGesture(); }} onPointerLeave={() => setHoveredId(null)} onDragStart={event => event.preventDefault()}
           onDoubleClick={event => {
-            if ((event.target as Element).hasAttribute('data-bend')) { changeArrow({ arrowStyle: 'straight', curve: 0 }); return; }
+            if ((event.target as Element).hasAttribute('data-bend')) {
+              // Double-clicking the middle handle takes the bow away, the way
+              // double-clicking a modifier resets it elsewhere in the app.
+              onChange(annotations.map(a => a.id === selectedArrow?.id ? { ...a, arrowStyle: 'straight', curve: 0 } : a));
+              return;
+            }
             if (tool !== 'select' || textEditorRef.current) return;
             const target = [...annotations].reverse().find(a => a.type === 'text' && contains(a, coordinates(event), 4 / displayScale));
             if (target) { setTextEditor({ annotation: target, value: target.text || '', isNew: false }); onSelect(target.id); }
@@ -319,12 +344,22 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
                 <rect data-handle={h.key} x={h.x - 7 / displayScale} y={h.y - 7 / displayScale} width={14 / displayScale} height={14 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: `${h.key}-resize` }} />
                 <rect x={h.x - 3 / displayScale} y={h.y - 3 / displayScale} width={6 / displayScale} height={6 / displayScale} fill="white" stroke={ACCENT} strokeWidth={1 / displayScale} />
               </g>)}
-              {selectedArrow && (['tail', 'tip'] as const).map(end => { const x = selectedArrow.x + (end === 'tip' ? selectedArrow.width : 0), y = selectedArrow.y + (end === 'tip' ? selectedArrow.height : 0); return <g key={end}><circle data-endpoint={end} cx={x} cy={y} r={9 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: 'crosshair' }} /><circle cx={x} cy={y} r={4 / displayScale} fill="white" stroke={ACCENT} strokeWidth={1.5 / displayScale} /></g>; })}
-              {selectedArrow && bendHandle && <g>
-                <line x1={selectedArrow.x + selectedArrow.width / 2} y1={selectedArrow.y + selectedArrow.height / 2} x2={bendHandle.x} y2={bendHandle.y} stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={`${3 / displayScale} ${3 / displayScale}`} opacity={0.6} />
-                <circle data-bend="1" cx={bendHandle.x} cy={bendHandle.y} r={10 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: 'grab' }}><title>Drag to bend. Double-click to straighten.</title></circle>
-                <circle cx={bendHandle.x} cy={bendHandle.y} r={4 / displayScale} fill={ACCENT} stroke="white" strokeWidth={1.5 / displayScale} />
-              </g>}
+              {selectedArrow && arrowTail && arrowTip && (
+                <>
+                  {([['tail', arrowTail], ['tip', arrowTip]] as const).map(([end, at]) => <g key={end}>
+                    <circle data-endpoint={end} cx={at.x} cy={at.y} r={9 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: 'crosshair' }} />
+                    <circle cx={at.x} cy={at.y} r={4.5 / displayScale} fill={ACCENT} stroke="white" strokeWidth={1.5 / displayScale} />
+                  </g>)}
+                  {bendHandle && chordMid && (
+                    <>
+                      {/* The dashed guide back to the chord is what makes the bow readable. */}
+                      <line x1={chordMid.x} y1={chordMid.y} x2={bendHandle.x} y2={bendHandle.y} stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={`${3 / displayScale} ${3 / displayScale}`} opacity={0.7} />
+                      <circle data-bend="1" cx={bendHandle.x} cy={bendHandle.y} r={11 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: 'grab' }}><title>Drag to curve the line. Double-click to straighten it.</title></circle>
+                      <circle cx={bendHandle.x} cy={bendHandle.y} r={5 / displayScale} fill={ACCENT} stroke="white" strokeWidth={1.5 / displayScale} />
+                    </>
+                  )}
+                </>
+              )}
             </>}
             {hoverBox && hovered?.type !== 'highlight' && !textEditor && <rect data-testid="hover-outline" {...hoverBox} fill="none" stroke={ACCENT} strokeWidth={1 / displayScale} opacity={0.65} />}
             {guides.map((g, i) => <line key={i} data-testid="editor-axis-guide" x1={g.from.x} y1={g.from.y} x2={g.to.x} y2={g.to.y} stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={`${4 / displayScale} ${4 / displayScale}`} opacity={0.7} />)}
@@ -332,14 +367,11 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
             {crop && <><path d={`M 0 0 H ${size.imageWidth} V ${size.imageHeight} H 0 Z M ${crop.x} ${crop.y} V ${crop.y + crop.height} H ${crop.x + crop.width} V ${crop.y} Z`} fill="rgba(30,30,38,0.5)" fillRule="evenodd" /><rect {...crop} fill="none" stroke="white" strokeWidth={1.5 / displayScale} strokeDasharray={`${6 / displayScale} ${4 / displayScale}`} /><path d={`M ${crop.x + crop.width / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x + crop.width * 2 / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x} ${crop.y + crop.height / 3} H ${crop.x + crop.width} M ${crop.x} ${crop.y + crop.height * 2 / 3} H ${crop.x + crop.width}`} fill="none" stroke="rgba(255,255,255,.4)" strokeWidth={0.5 / displayScale} /></>}
           </g></svg>
           {showSelection && selection && !selectedArrow && !markerSelected && <div data-testid="selection-size" className="absolute pointer-events-none whitespace-nowrap rounded-[3px] bg-accent px-1.5 py-0.5 text-[10px] text-white" style={{ left: (size.imageX + selection.x + selection.width / 2) * displayScale, top: (size.imageY + selection.y + selection.height) * displayScale + 10, transform: 'translateX(-50%)' }}>{Math.round(selection.width)} × {Math.round(selection.height)}{selectedItems.length > 1 ? ` · ${selectedItems.length} layers` : ''}</div>}
-          {lineControls && <div role="toolbar" aria-label="Line controls" data-testid="line-controls" onPointerDown={event => event.stopPropagation()} className="absolute z-10 flex items-center gap-0.5 rounded-lg border border-line bg-white p-1 shadow-[0_3px_14px_rgba(0,0,0,.12)] cursor-default" style={{ left: Math.max(8, Math.min(size.width * displayScale - 236, selectedArrow ? (size.imageX + selectedArrow.x + selectedArrow.width / 2) * displayScale - 108 : size.width * displayScale / 2 - 108)), top: selectedArrow && selection ? Math.min(size.height * displayScale - 40, Math.max(8, (size.imageY + selection.y + selection.height) * displayScale + 24)) : 12 }}>
-            {(['straight', 'curved', 'elbow'] as const).map((value, i) => <button key={value} type="button" aria-pressed={lineStyle === value} onClick={() => changeArrow({ arrowStyle: value })} className="rounded px-2.5 py-1.5 text-[11px] text-ink-2 hover:bg-panel aria-pressed:bg-accent-soft aria-pressed:text-accent-ink">{['Straight', 'Curved', 'Bent'][i]}</button>)}
-            {lineStyle === 'elbow' && <button type="button" aria-label="Change line turn" title="Switch the corner" onClick={() => changeArrow({ arrowTurn: (selectedArrow?.arrowTurn ?? arrow.arrowTurn) === 'vertical-first' ? 'horizontal-first' : 'vertical-first' })} className="rounded px-2 py-1.5 hover:bg-panel">↳</button>}
-          </div>}
+
           {textEditor && <InlineTextEditor annotation={textEditor.annotation} value={textEditor.value} isNew={textEditor.isNew} scale={displayScale} imageX={size.imageX} imageY={size.imageY} onChange={value => setTextEditor({ ...textEditor, value })} onCommit={commitText} onCancel={() => { const id = textEditor.isNew ? null : textEditor.annotation.id; setTextEditor(null); onSelect(id); onToolChange?.('select'); }} />}
         </div> : <div className="flex flex-col items-center gap-2 text-center text-ink-3"><strong className="text-[13px] font-medium text-ink">{loadingMessage ? 'Opening your screenshot' : 'No image loaded'}</strong><span className="text-app">{loadingMessage ?? 'Drop a screenshot here, or import one from the file menu.'}</span></div>}
       </div>
-      {!textEditor && ['highlight', 'pen', 'select', 'arrow'].includes(tool) && <div className="sticky bottom-3 mx-auto w-fit max-w-[90%] pointer-events-none rounded-md bg-white/90 px-3 py-1.5 text-[10px] text-ink-2 shadow-sm" style={{ marginTop: -30 }}>{tool === 'highlight' ? 'Snap to a row · Alt to draw freely · Shift for 45°' : tool === 'pen' ? 'Draw freely · Shift for a straight stroke · Esc to cancel' : tool === 'arrow' ? 'Drag to draw · Drag the middle handle to bend' : 'Drag to select · Shift-click to add · Arrow keys to nudge'}</div>}
+      {!textEditor && ['highlight', 'pen', 'select', 'arrow', 'rectangle', 'ellipse', 'text'].includes(tool) && <div className="sticky bottom-3 mx-auto w-fit max-w-[90%] pointer-events-none rounded-md bg-white/90 px-3 py-1.5 text-[10px] text-ink-2 shadow-sm" style={{ marginTop: -30 }}>{tool === 'highlight' ? 'Snap to a row · Alt to draw freely · Shift for 45°' : tool === 'pen' ? 'Draw freely · Shift for a straight stroke · Esc to cancel' : tool === 'arrow' ? 'Drag to draw · Drag the middle dot to curve · Shift for 45°' : tool === 'rectangle' || tool === 'ellipse' ? 'Drag to draw · Shift for square · Alt from center · Esc to cancel' : tool === 'text' ? 'Click to type · Drag a corner to resize · Esc to finish' : 'Drag to select · Shift-click to add · Arrow keys to nudge'}</div>}
     </div>
   );
 }

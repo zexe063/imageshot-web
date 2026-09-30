@@ -115,21 +115,22 @@ export default function InlineTextEditor({
           onChange(event.currentTarget.value);
           if (blurredDuringComposition.current) finish();
         }}
-        onBlur={() => {
-          if (composing.current) blurredDuringComposition.current = true;
-          else finish();
-        }}
-        onKeyDown={event => {
-          event.stopPropagation();
-          if (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
-          if (event.key === 'Escape') {
-            event.preventDefault();
-            finish(true);
-          } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-            event.preventDefault();
-            finish();
-          }
-        }}
+          onBlur={() => {
+            // Professional: click outside commits immediately (Figma/CleanShot style)
+            if (composing.current) blurredDuringComposition.current = true;
+            else finish();
+          }}
+          onKeyDown={event => {
+            event.stopPropagation();
+            if (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+            if (event.key === 'Escape') {
+              event.preventDefault();
+              finish(true);
+            } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              finish();
+            }
+          }}
         style={{
           position: 'absolute',
           left: 0,
@@ -167,7 +168,7 @@ export default function InlineTextEditor({
           cursor: 'text',
         }}
       />
-      <span id={helpId} className="sr-only">Enter for a new line. Control or Command and Enter to finish. Escape to cancel.</span>
+        <span id={helpId} className="sr-only">Enter for a new line. Ctrl/Cmd+Enter to finish. Escape to cancel.</span>
     </div>
   );
 }

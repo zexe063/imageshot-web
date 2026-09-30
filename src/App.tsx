@@ -6,8 +6,8 @@ import PropertiesPanel from './components/PropertiesPanel';
 import TopBar, { TOOLS } from './components/TopBar';
 import ExportMenu from './components/ExportMenu';
 import { IconButton } from './components/ui';
-import { DEFAULT_STYLE, type Annotation, type ArrowEnds, type ArrowHead, type ArrowStyle, type ArrowTurn, type CompositionStyle, type Tool } from './lib/editor-types';
-import { annotationBounds, ARROW_CURVE_DEFAULT, getCompositionSize, renderComposition } from './lib/render';
+import { DEFAULT_STYLE, type Annotation, type ArrowEnds, type ArrowHead, type ArrowStyle, type CompositionStyle, type Tool } from './lib/editor-types';
+import { annotationBounds, getCompositionSize, renderComposition } from './lib/render';
 import { selectionBounds, transformAnnotation } from './lib/selection';
 import { layerDisplayName, layerLabel } from './lib/naming';
 import { captureFitScale, getCapture, listCaptures, materializeCapture, type CaptureRecord } from './lib/capture-store';
@@ -16,8 +16,7 @@ import { createExportBlob, type ExportFormat, type PdfPageSize } from './lib/exp
 
 const toolIcons = TOOLS.reduce<Record<string, IconName>>((map, tool) => ({ ...map, [tool.id]: tool.icon }), {});
 
-const ARROW_STYLE_ORDER: ArrowStyle[] = ['straight', 'curved', 'elbow'];
-const ARROW_STYLE_LABELS: Record<ArrowStyle, string> = { straight: 'Straight', curved: 'Curved', elbow: 'Bent' };
+
 
 /** Captures larger than one browser canvas open reduced, so report the real size. */
 function captureDimensions(capture: CaptureRecord): string {
@@ -94,7 +93,7 @@ export default function App() {
   const setSelectedId = useCallback((id: string | null) => setSelectedIds(id ? [id] : []), []);
   const changeSelection = useCallback((ids: string[]) => setSelectedIds([...new Set(ids)]), []);
   const nudgeDocument = useRef<ShotDocument | null>(null);
-  const [defaults, setDefaults] = useState({ color: '#000000', strokeWidth: 4, fontSize: 32, fontFamily: 'Inter', fontWeight: 600, lineHeight: 1.3, letterSpacing: 0, align: 'left' as NonNullable<Annotation['align']>, fill: null as string | null, radius: 3, opacity: 100, arrowStyle: 'straight' as ArrowStyle, curve: ARROW_CURVE_DEFAULT, arrowHead: 'chevron' as ArrowHead, arrowEnds: 'head' as ArrowEnds, headSize: 0, arrowTurn: 'horizontal-first' as ArrowTurn });
+  const [defaults, setDefaults] = useState({ color: '#000000', strokeWidth: 4, fontSize: 32, fontFamily: 'Inter', fontWeight: 600, lineHeight: 1.3, letterSpacing: 0, align: 'left' as NonNullable<Annotation['align']>, fill: null as string | null, radius: 3, opacity: 100, arrowStyle: 'straight' as ArrowStyle, curve: 0, arrowHead: 'chevron' as ArrowHead, arrowEnds: 'head' as ArrowEnds, headSize: 0 });
   const toolDefaults = useRef(new Map<Tool, typeof defaults>());
   function setTool(next: Tool) {
     if (next === tool) return;
@@ -234,7 +233,7 @@ export default function App() {
         const compatible = Object.fromEntries(Object.entries(patch).filter(([key]) => {
           if (boxKeys.includes(key)) return false;
           if (['fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'letterSpacing', 'align', 'text'].includes(key)) return annotation.type === 'text';
-          if (['arrowStyle', 'curve', 'arrowHead', 'arrowEnds', 'headSize', 'arrowTurn'].includes(key)) return annotation.type === 'arrow';
+          if (['arrowStyle', 'curve', 'arrowHead', 'arrowEnds', 'headSize'].includes(key)) return annotation.type === 'arrow';
           if (key === 'fill') return annotation.type === 'rectangle' || annotation.type === 'ellipse';
           if (key === 'radius') return annotation.type === 'rectangle';
           return ['color', 'strokeColor', 'strokeWidth', 'opacity'].includes(key);
@@ -369,26 +368,7 @@ export default function App() {
       }
       if (event.key === 'Delete' || event.key === 'Backspace') { event.preventDefault(); deleteSelected(); }
       if (event.key === 'Escape') { setTool('select'); setSelectedId(null); setMenuOpen(false); setExportOpen(false); }
-      // Shift with a tool key takes the shortcut further: on Line it cycles the arrow
-      // body, and the brackets step its bend, the way a weight does.
-      if (event.shiftKey && event.key.toLowerCase() === 'a') {
-        event.preventDefault();
-        if (tool !== 'arrow') { setTool('arrow'); return; }
-        const next = ARROW_STYLE_ORDER[(ARROW_STYLE_ORDER.indexOf(selected?.arrowStyle ?? defaults.arrowStyle) + 1) % ARROW_STYLE_ORDER.length];
-        sendArrow({ arrowStyle: next });
-        notify(`Arrow body: ${ARROW_STYLE_LABELS[next]}.`);
-        return;
-      }
-      if (event.key === '[' || event.key === ']') {
-        if (selected?.type !== 'arrow' && tool !== 'arrow') return;
-        event.preventDefault();
-        const style = selected?.arrowStyle ?? defaults.arrowStyle;
-        const base = selected?.curve ?? defaults.curve ?? ARROW_CURVE_DEFAULT;
-        const next = Math.round((base + (event.key === ']' ? 0.1 : -0.1)) * 100) / 100;
-        // A rounded corner only rounds one way, so it never goes below flat.
-        sendArrow({ curve: Math.max(style === 'elbow' ? 0 : -1, Math.min(1, next)) });
-        return;
-      }
+
       const match = TOOLS.find(tool => tool.key.toLowerCase() === event.key.toLowerCase());
       if (match) { event.preventDefault(); if (match.id !== 'select') setSelectedId(null); setTool(match.id); }
       if (event.key === '0') setZoom(1);
@@ -660,7 +640,7 @@ export default function App() {
                 <kbd className="font-ui text-[10px] font-[450] px-1 py-0.5 rounded-[4px] whitespace-nowrap bg-field text-ink-2 shadow-[inset_0_0_0_1px_rgba(0,0,0,.05)]">{tool.key}</kbd>
               </div>
             ))}
-            {[['Select multiple layers', 'Shift click / drag'], ['Select all unlocked layers', 'Ctrl A'], ['Nudge selection', 'Arrow keys'], ['Nudge by 10 px', 'Shift Arrow'], ['Cycle arrow body', 'Shift A'], ['Bend arrow on canvas', 'Drag center handle'], ['Adjust arrow bend', '[  ]'], ['Highlight a text row', 'Drag to snap'], ['Freehand highlighter', 'Alt drag'], ['Undo', 'Ctrl Z'], ['Redo', 'Ctrl Shift Z'], ['Export', 'Ctrl S'], ['Import image', 'Ctrl O'], ['Duplicate selection', 'Ctrl D'], ['Delete selection', 'Delete'], ['Fit canvas', '0']].map(([label, keys]) => (
+            {[['Select multiple layers', 'Shift click / drag'], ['Select all unlocked layers', 'Ctrl A'], ['Nudge selection', 'Arrow keys'], ['Nudge by 10 px', 'Shift Arrow'], ['Square / circle', 'Shift drag'], ['From center', 'Alt drag'], ['Highlight a text row', 'Drag to snap'], ['Freehand highlighter', 'Alt drag'], ['45° line', 'Shift drag'], ['Undo', 'Ctrl Z'], ['Redo', 'Ctrl Shift Z'], ['Export', 'Ctrl S'], ['Import image', 'Ctrl O'], ['Duplicate selection', 'Ctrl D'], ['Delete selection', 'Delete'], ['Fit canvas', '0']].map(([label, keys]) => (
               <div key={label} className="flex items-center justify-between h-7 px-2 rounded-[5px] odd:bg-panel"><span>{label}</span><kbd className="font-ui text-[10px] font-[450] px-1 py-0.5 rounded-[4px] whitespace-nowrap bg-field text-ink-2 shadow-[inset_0_0_0_1px_rgba(0,0,0,.05)]">{keys}</kbd></div>
             ))}
           </div>

@@ -234,67 +234,106 @@ test('a highlight can be picked, moved and deleted like any other layer', async 
   } finally { await page.close(); }
 });
 
-test('arrow bodies bend three ways and the bend handle drags the curve', async () => {
+test('the middle handle on a line bows the arrow, and double-click straightens it', async () => {
   const page = await editor();
   try {
-    // A flat drag puts the chord on the x axis, so the bend is a pure vertical offset.
+    // A flat drag puts the chord on the x axis, so the bow is a pure vertical offset.
     const chord = [350, 200];
-    const bow = [350, 260];
+    const above = [350, 140];
+    const below = [350, 260];
     await frames(page);
-    const emptyBow = (await probe(page, [bow]))[0];
+    const empty = (await probe(page, [chord, above, below])).map(pixel => [...pixel]);
 
     await page.getByRole('button', { name: 'Line (A)', exact: true }).click();
     await drag(page, [200, 200], [500, 200]);
     await frames(page);
-    const straightChord = (await probe(page, [chord]))[0];
-    assert.ok(distance(straightChord, emptyBow) > INK, 'the straight body sits on its chord');
-    assert.ok(distance((await probe(page, [bow]))[0], emptyBow) <= INK, 'a straight arrow has no ink off its chord');
-    assert.equal(await page.locator('[data-testid="editor-artboard"] [data-bend]').count(), 0);
+    const straight = await probe(page, [chord, above, below]);
+    assert.ok(distance(straight[0], empty[0]) > INK, 'the body sits on its chord');
+    assert.ok(distance(straight[1], empty[1]) <= INK && distance(straight[2], empty[2]) <= INK, 'a straight line has no ink off its chord');
 
-    await page.getByRole('button', { name: 'Curved', exact: true }).click();
-    await frames(page);
-    assert.equal(await page.locator('[data-testid="editor-artboard"] [data-bend]').count(), 1);
-    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Curved line' }).count(), 1);
-    assert.ok(distance((await probe(page, [chord]))[0], straightChord) > INK, 'a curved arrow leaves its chord bare');
-    assert.ok(distance((await probe(page, [bow]))[0], emptyBow) > INK, 'a curved arrow bows away from the chord');
+    // The handle is always there, on the body itself, so a straight line can be bowed
+    // without a mode to switch into first.
+    const handle = page.locator('[data-testid="editor-artboard"] [data-bend]');
+    assert.equal(await handle.count(), 1, 'a selected line shows one middle handle');
+    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Line 1' }).count(), 1);
 
-    // Dragging the handle to the far side carries the bow with it.
-    const handle = await page.locator('[data-testid="editor-artboard"] [data-bend]').boundingBox();
-    const far = [350, 140];
-    const above = await imagePoint(page, ...far);
-    await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+    // Dragging it up takes the body off the chord on that side.
+    const box = await handle.boundingBox();
+    const tip = await imagePoint(page, ...above);
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
     await page.mouse.down();
-    await page.mouse.move(above.x, above.y, { steps: 10 });
+    await page.mouse.move(tip.x, tip.y, { steps: 12 });
     await page.mouse.up();
     await frames(page);
-    assert.ok(distance((await probe(page, [far]))[0], emptyBow) > INK, 'the bow moved to the other side of the chord');
-    assert.ok(distance((await probe(page, [bow]))[0], emptyBow) <= INK, 'the old side of the bow is bare again');
-    assert.ok(Number(await page.getByLabel('Arrow bend', { exact: true }).inputValue()) < 0, 'the bend is negative after dragging above the chord');
+    const bowed = await probe(page, [chord, above, below]);
+    assert.ok(distance(bowed[1], empty[1]) > INK, 'the bow follows the handle to the other side of the chord');
+    assert.ok(distance(bowed[2], empty[2]) <= INK, 'the old side of the chord is bare again');
+    assert.ok(distance(bowed[0], straight[0]) <= INK, 'the chord itself stays clear of a shallow bow');
+    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Curved line' }).count(), 1, 'a bowed line is named for it');
 
-    // A bent arrow needs two legs, so it is drawn on the diagonal where it has a corner.
-    // The body runs along the tail's row, rounds the corner, then down the tip's column.
-    const tailRow = [450, 400];
-    const tipColumn = [500, 450];
-    const across = [350, 460];
-    const background = await probe(page, [tailRow, tipColumn, across]);
-    await drag(page, [200, 400], [500, 520]);
+    // Carrying the handle to the far side carries the bow with it.
+    const flipped = await handle.boundingBox();
+    const down = await imagePoint(page, ...below);
+    await page.mouse.move(flipped.x + flipped.width / 2, flipped.y + flipped.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(down.x, down.y, { steps: 12 });
+    await page.mouse.up();
     await frames(page);
-    assert.ok(distance((await probe(page, [across]))[0], background[2]) > INK, 'the second arrow starts straight across its chord');
-    await page.getByRole('button', { name: 'Bent', exact: true }).click();
-    await frames(page);
-    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Bent line' }).count(), 1);
-    assert.ok(distance((await probe(page, [tailRow]))[0], background[0]) > INK, 'a bent arrow runs along the row it starts on');
-    assert.ok(distance((await probe(page, [tipColumn]))[0], background[1]) > INK, 'a bent arrow finishes down the tip column');
-    assert.ok(distance((await probe(page, [across]))[0], background[2]) <= INK, 'a bent arrow never crosses its own chord');
-    assert.equal(await page.getByLabel('Arrow corner', { exact: true }).inputValue(), '40', 'the corner keeps the bend it was given');
+    const other = await probe(page, [chord, above, below]);
+    assert.ok(distance(other[2], empty[2]) > INK, 'the bow moved to the other side');
+    assert.ok(distance(other[1], empty[1]) <= INK, 'the first side is bare again');
 
-    // Both arrows still select, and going back to straight restores the first body.
-    await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Curved line' }).click();
+    // Double-clicking the handle takes the bow away.
+    const reset = await handle.boundingBox();
+    await page.mouse.dblclick(reset.x + reset.width / 2, reset.y + reset.height / 2);
     await frames(page);
-    await page.getByRole('button', { name: 'Straight', exact: true }).click();
+    const flat = await probe(page, [chord, above, below]);
+    assert.ok(distance(flat[0], empty[0]) > INK, 'the line is straight again');
+    assert.ok(distance(flat[1], empty[1]) <= INK && distance(flat[2], empty[2]) <= INK, 'no ink is left off the chord');
+    assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Line 1' }).count(), 1);
+  } finally { await page.close(); }
+});
+
+test('only the four corners resize a shape, and a corner keeps proportions with Shift', async () => {
+  const page = await editor();
+  try {
+    await page.getByRole('button', { name: 'Rectangle (R)', exact: true }).click();
+    await drag(page, [200, 160], [440, 320]);
     await frames(page);
-    assert.equal(await page.locator('[data-testid="editor-artboard"] [data-bend]').count(), 0);
-    assert.ok(distance((await probe(page, [chord]))[0], emptyBow) > INK, 'going back to straight restores the original body');
+    const handles = page.locator('[data-testid="editor-artboard"] [data-handle]');
+    assert.equal(await handles.count(), 4, 'a shape offers four resize handles, not eight');
+    assert.deepEqual(
+      (await handles.evaluateAll(nodes => nodes.map(node => node.getAttribute('data-handle')))).sort(),
+      ['ne', 'nw', 'se', 'sw'],
+      'the mid-edge handles are gone',
+    );
+
+    // The corner drags the opposite corner's opposite edge with it.
+    const start = await selection(page);
+    const se = await page.locator('[data-handle="se"]').boundingBox();
+    const corner = await imagePoint(page, 560, 400);
+    await page.mouse.move(se.x + se.width / 2, se.y + se.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(corner.x, corner.y, { steps: 10 });
+    await page.mouse.up();
+    await frames(page);
+    const grown = await selection(page);
+    assert.ok(Math.abs(grown.x - start.x) < 1 && Math.abs(grown.y - start.y) < 1, 'the top left corner stays put');
+    assert.ok(grown.width > start.width + 80 && grown.height > start.height + 50, 'the dragged corner sets both edges');
+
+    // Shift locks the shape to its own proportions while a corner is dragged.
+    const ratio = grown.width / grown.height;
+    const sw = await page.locator('[data-handle="sw"]').boundingBox();
+    const moved = await imagePoint(page, 120, 420);
+    await page.keyboard.down('Shift');
+    await page.mouse.move(sw.x + sw.width / 2, sw.y + sw.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(moved.x, moved.y, { steps: 10 });
+    await page.mouse.up();
+    await page.keyboard.up('Shift');
+    await frames(page);
+    const locked = await selection(page);
+    assert.ok(Math.abs(locked.width / locked.height - ratio) < 0.02, `Shift keeps the proportions, got ${locked.width}/${locked.height} against ${ratio}`);
   } finally { await page.close(); }
 });
 
@@ -390,36 +429,43 @@ test('arrow heads come in four shapes, both ends, and a size of their own', asyn
   } finally { await page.close() }
 });
 
-test('Shift with the Line key cycles the arrow body and the brackets step its bend', async () => {
+test('a drawn shape hands the canvas back to Select, and Shift or Alt shapes the drag', async () => {
   const page = await editor();
   try {
-    await page.keyboard.press('Shift+a');
-    assert.equal(await page.getByRole('button', { name: 'Line (A)', exact: true }).getAttribute('data-active'), 'true', 'Shift+A takes the Line tool when it is not in use');
-    await page.keyboard.press('Shift+a');
-    assert.equal(await page.getByRole('button', { name: 'Curved', exact: true }).getAttribute('aria-pressed'), 'true', 'a second press curves the next arrow');
-    await page.keyboard.press('Shift+a');
-    assert.equal(await page.getByRole('button', { name: 'Bent', exact: true }).getAttribute('aria-pressed'), 'true');
-    await page.keyboard.press('Shift+a');
-    assert.equal(await page.getByRole('button', { name: 'Straight', exact: true }).getAttribute('aria-pressed'), 'true', 'the cycle comes back round');
+    // Placing a shape returns to Select, so the next drag moves it instead of drawing
+    // another one. A tool key is the way to draw more.
+    await page.getByRole('button', { name: 'Rectangle (R)', exact: true }).click();
+    await drag(page, [200, 160], [440, 320]);
+    await frames(page);
+    assert.equal(await page.getByRole('button', { name: 'Select (V)', exact: true }).getAttribute('data-active'), 'true', 'a placed shape hands back Select');
+    assert.equal(await page.locator('[data-testid="layer-row"]:not([data-kind="image"])').count(), 1, 'one drag makes one shape');
+    const placed = await selection(page);
+    await drag(page, [300, 240], [360, 300]);
+    await frames(page);
+    assert.equal(await page.locator('[data-testid="layer-row"]:not([data-kind="image"])').count(), 1, 'the second drag moved the shape rather than drawing another');
+    const moved = await selection(page);
+    assert.ok(Math.abs(moved.x - placed.x - 60) < 2 && Math.abs(moved.y - placed.y - 60) < 2, 'the shape followed the pointer');
 
-    // With an arrow in hand the brackets move that arrow, not the tool default.
-    await drag(page, [200, 200], [500, 200]);
+    // Shift squares the shape off, and Alt grows it from its own centre.
+    await page.getByRole('button', { name: 'Rectangle (R)', exact: true }).click();
+    await shiftDrag(page, [200, 420], [560, 500]);
     await frames(page);
-    assert.equal(await page.getByLabel('Arrow bend', { exact: true }).count(), 0, 'a straight arrow has no bend to step');
-    await page.getByRole('button', { name: 'Curved', exact: true }).click();
-    await frames(page);
-    const start = Number(await page.getByLabel('Arrow bend', { exact: true }).inputValue());
-    await page.keyboard.press(']');
-    await page.keyboard.press(']');
-    assert.equal(Number(await page.getByLabel('Arrow bend', { exact: true }).inputValue()), start + 20, '] bends it further');
-    await page.keyboard.press('[');
-    assert.equal(Number(await page.getByLabel('Arrow bend', { exact: true }).inputValue()), start + 10, '[ bends it back');
+    const squared = await selection(page);
+    assert.ok(Math.abs(squared.width - squared.height) < 1, `Shift draws a square, got ${squared.width} by ${squared.height}`);
 
-    // A rounded corner never goes below flat, however far the bend is driven down.
-    await page.getByRole('button', { name: 'Bent', exact: true }).click();
+    const start = await imagePoint(page, 300, 640);
+    const end = await imagePoint(page, 420, 700);
+    await page.keyboard.down('Alt');
+    await page.mouse.move(start.x, start.y);
+    await page.mouse.down();
+    await page.mouse.move(end.x, end.y, { steps: 10 });
+    await page.mouse.up();
+    await page.keyboard.up('Alt');
     await frames(page);
-    for (let press = 0; press < 20; press += 1) await page.keyboard.press('[');
-    assert.equal(Number(await page.getByLabel('Arrow corner', { exact: true }).inputValue()), 0, 'a corner stops at a square joint');
+    const centred = await selection(page);
+    assert.ok(Math.abs(centred.x + centred.width / 2 - 300) < 2, 'Alt grows the shape from its centre');
+    assert.ok(Math.abs(centred.y + centred.height / 2 - 640) < 2, 'Alt grows the shape from its centre');
+    assert.ok(Math.abs(centred.width - 240) < 2 && Math.abs(centred.height - 120) < 2, 'Alt doubles the drag in both directions');
   } finally { await page.close(); }
 });
 

@@ -260,7 +260,6 @@ export default function PropertiesPanel({
                   </PropertyField>
                 </>
               ) : null}
-              <p className="text-[11px] leading-relaxed text-ink-2">Drag the middle handle on the canvas to bend the line.</p>
             </Section>
           </>
         ) : null}
