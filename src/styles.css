@@ -56,7 +56,9 @@
 }
 
 @keyframes busy {
-  to { transform: rotate(360deg); }
+  /* An SVG box turns about its own origin, which is the top-left corner, not the
+     middle, so the box is named here or the glyph swings around instead of spinning. */
+  to { transform: rotate(360deg); transform-box: fill-box; transform-origin: center; }
 }
 
 /** The hairline between the cells of a colour row; only a cell that follows another gets one. */
@@ -85,7 +87,6 @@
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     color: var(--color-ink);
-    background: var(--color-canvas);
     color-scheme: light;
   }
 

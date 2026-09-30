@@ -444,105 +444,88 @@ interface CapturePanelPayload {
  * capture can be copied without leaving what was captured. Keep every browser
  * dependency inside it, and nothing from this module: it is sent as source text.
  */
+
 async function showCapturePanel(payload: CapturePanelPayload): Promise<void> {
   document.querySelector('[data-imageshot-capture]')?.remove()
   const host = document.createElement('div')
   host.setAttribute('data-imageshot-capture', '')
   host.style.cssText = 'all:initial!important;position:fixed!important;right:20px!important;bottom:20px!important;z-index:2147483647!important;'
-  // Open, unlike the selector and the error toast: this is a panel the person is meant
-  // to press, and the page showing a screenshot of it has nothing to learn.
   const shadow = host.attachShadow({ mode: 'open' })
-  // The accent matches the Studio's. A shadow root cannot read the page's tokens, so
-  // the one colour it needs is written out here.
-  shadow.innerHTML = `<style>
-    :host { color-scheme:light; --accent:#6244e0; --ink:#1e1e1e; --ink-2:#757575; --ink-3:#a9a6b4; --line:#eae7f0; }
-    * { box-sizing:border-box; }
-    .panel { width:300px; overflow:hidden; background:#fff; border-radius:13px; color:var(--ink);
-      border:.5px solid rgba(20,15,45,.10);
-      box-shadow:0 0 0 .5px rgba(20,15,45,.04), 0 1px 2px rgba(20,15,45,.06), 0 10px 26px rgba(20,15,45,.13);
-      font:500 12px/1.3 Inter,system-ui,-apple-system,sans-serif; -webkit-font-smoothing:antialiased;
-    }
-
-    /* The screenshot is the panel. Everything else is deliberately quiet. */
-    .shot { position:relative; display:grid; place-items:center; height:176px; padding:11px; background:linear-gradient(180deg,#f7f6fa,#f1f0f5); border-bottom:1px solid var(--line); }
-    .picture { position:relative; line-height:0; }
-    .picture canvas { display:block; border-radius:4px; box-shadow:0 0 0 1px rgba(20,15,45,.11), 0 2px 6px rgba(20,15,45,.10); }
-
-    /* Shown when a long page is shown from the top rather than letterboxed to a sliver. */
-    .more { position:absolute; left:0; right:0; bottom:0; padding:20px 10px 8px; border-radius:0 0 4px 4px; background:linear-gradient(transparent,rgba(16,12,32,.72)); color:#fff; font-size:10px; font-weight:550; letter-spacing:.1px; text-align:center; line-height:1.2; }
-    .more[hidden] { display:none; }
-
-    .preview { position:absolute; inset:0; border:0; padding:0; border-radius:0; background:none; cursor:pointer; }
-    .preview:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
-    .hint { position:absolute; inset:0; display:grid; place-items:center; opacity:0; transition:opacity .14s ease; background:rgba(24,20,40,.16); border-radius:0; pointer-events:none; }
-    .hint span { padding:5px 10px; border-radius:7px; background:rgba(255,255,255,.96); box-shadow:0 2px 10px rgba(20,15,45,.24); }
-    .preview:hover ~ .hint, .preview:focus-visible ~ .hint { opacity:1; }
-
-    /* A round control floating on the picture, the way a native panel carries one. */
-    .close { position:absolute; top:7px; right:7px; z-index:2; display:grid; place-items:center; width:24px; height:24px; padding:0; border:0; border-radius:50%; color:var(--ink-2); background:rgba(255,255,255,.86); backdrop-filter:blur(8px) saturate(1.4); -webkit-backdrop-filter:blur(8px) saturate(1.4); box-shadow:0 0 0 .5px rgba(20,15,45,.10), 0 1px 3px rgba(20,15,45,.14); transition:color .12s ease, background .12s ease; }
-    .close:hover { color:var(--ink); background:#fff; }
-
-    /* Each button carries its own reset, so nothing can out-specify its fill. */
-    .row { display:flex; gap:7px; padding:10px 10px 0; }
-    .action { flex:1; display:inline-flex; align-items:center; justify-content:center; gap:5px; height:31px; padding:0; border:0; border-radius:8px; background:none; font:550 12px/1 Inter,system-ui,-apple-system,sans-serif; letter-spacing:-.1px; transition:background .12s ease, color .12s ease, opacity .12s ease; }
-    .primary { background:var(--accent); color:#fff; box-shadow:0 1px 2px rgba(36,20,92,.22); }
-    .primary:hover:not(:disabled) { background:#563ad0; }
-    .secondary { background:#f3f1f8; color:var(--ink); }
-    .secondary:hover { background:#eae6f5; }
-    .action:disabled { opacity:.4; cursor:not-allowed; }
-    .action svg { flex:none; }
-
-    .meta { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 12px 11px; font-size:10.5px; font-weight:500; color:var(--ink-3); }
-    .format { padding:1.5px 5px; border-radius:4px; background:#f3f1f8; color:var(--ink-2); font-size:9.5px; font-weight:600; letter-spacing:.3px; }
-
-    .note { margin:0; padding:0 12px 11px; font-size:10.5px; font-weight:400; line-height:1.5; color:var(--ink-2); }
-
-    /* A capture that is still being stitched says so, and looks like it means it. */
-    .working { position:relative; overflow:hidden; width:100%; height:100%; display:grid; place-items:center; font-size:11.5px; font-weight:500; color:var(--ink-3); }
-    .working::after { content:''; position:absolute; inset:0; background:linear-gradient(90deg,transparent,rgba(255,255,255,.85),transparent); animation:sweep 1.15s ease-in-out infinite; }
-    @keyframes sweep { from { transform:translateX(-100%); } to { transform:translateX(100%); } }
-    @media (prefers-reduced-motion: reduce) { .working::after { animation:none; } }
-  </style>
-  <div class="panel" role="dialog" aria-label="ImageShot capture">
-    <div class="shot">
-      <div class="picture">
-        <div class="working">Preparing your screenshot…</div>
-        <div class="more" hidden>Top of a long page</div>
+  shadow.innerHTML = `
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Geist:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  :host { color-scheme:light; }
+  * { box-sizing:border-box; }
+  .wrap{
+    width:250px; height:200px; border-radius:12px; overflow:hidden; background:#1a1a1f;
+    border:1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 0 0 0.5px rgba(0,0,0,0.4), 0 2px 8px rgba(0,0,0,0.24), 0 12px 28px rgba(0,0,0,0.32);
+    -webkit-font-smoothing:antialiased;
+  }
+  .shot{position:relative; width:250px; height:200px; display:grid; place-items:center; background:#0B0B12; line-height:0;}
+  .picture{position:relative; width:250px; height:200px; display:grid; place-items:center; line-height:0;}
+  .picture canvas{display:block; max-width:250px; max-height:200px; width:auto; height:auto; object-fit:contain;}
+  .overlay{
+    position:absolute;inset:0;display:grid;place-items:center;
+    background:rgba(12,12,16,0.44); opacity:0; pointer-events:none; transition:opacity .18s ease;
+  }
+  .wrap:hover .overlay{opacity:1;pointer-events:auto}
+  .stack{display:flex;flex-direction:column;gap:8px;align-items:center;}
+  .pill{
+    height:30px; min-width:84px; padding:0 18px; border-radius:99px;
+    background:#f0f0f3; color:#111113; border:none;
+    font-family:'Geist','Inter',-apple-system,system-ui,sans-serif;
+    font-size:13px; font-weight:500; letter-spacing:-0.01em;
+    box-shadow:0 1px 2px rgba(0,0,0,0.14), 0 2px 6px rgba(0,0,0,0.12);
+    cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+    transition: background .15s ease;
+  }
+  .pill:hover{background:#ffffff;}
+  .pill:disabled{opacity:.6; cursor:not-allowed;}
+  .corner{
+    position:absolute;width:24px;height:24px;display:grid;place-items:center;
+    border-radius:50%; background:#f0f0f3; color:#111113; border:none;
+    box-shadow:0 1px 3px rgba(0,0,0,0.22); cursor:pointer; transition: background .15s ease;
+  }
+  .corner:hover{background:#fff;}
+  .corner.tl{top:8px;left:8px} .corner.tr{top:8px;right:8px}
+  .working{width:250px; height:200px; display:grid; place-items:center; font-family:'Geist','Inter',sans-serif; font-size:12.5px; font-weight:500; color:#8e8e93; background:#14141a}
+  .more{position:absolute; left:0; right:0; bottom:0; padding:16px 10px 8px; background:linear-gradient(transparent,rgba(16,12,32,.72)); color:#fff; font-family:'Geist','Inter',sans-serif; font-size:10px; text-align:center;}
+  .more[hidden]{display:none;}
+  .note{margin:0; padding:6px 10px; font-family:'Geist','Inter',sans-serif; font-size:10.5px; color:#a9a6b4; background:#fff;}
+  .note[hidden]{display:none;}
+</style>
+<div class="wrap" role="dialog" aria-label="ImageShot capture">
+  <div class="shot">
+    <div class="picture">
+      <div class="working">Preparing your screenshot…</div>
+      <div class="more" hidden>Top of a long page</div>
+    </div>
+    <div class="overlay">
+      <button class="corner tl" type="button" data-close aria-label="Close">
+        <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+      <button class="corner tr" type="button" data-studio aria-label="Expand">
+        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3 h5.5 v5.5"/><path d="M8.2 7.8L12.8 3.2"/><path d="M12.8 9.2V12.8H3.2V3.2H6.8"/></svg>
+      </button>
+      <div class="stack">
+        <button class="pill" type="button" data-copy>Copy</button>
+        <button class="pill" type="button" data-save-main>Save</button>
       </div>
-      <button class="preview" type="button" aria-label="Open this screenshot in the Studio"></button>
-      <div class="hint"><span>Open in Studio</span></div>
-      <button class="close" type="button" aria-label="Close">
-        <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></svg>
-      </button>
     </div>
-    <div class="row">
-      <button class="action primary" type="button" data-copy>
-        <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.6" y="2.6" width="7.6" height="7.6" rx="2"/><path d="M5.6 13.4h5.8a2 2 0 0 0 2-2V5.6"/></svg>
-        <span>Copy</span>
-      </button>
-      <button class="action secondary" type="button" data-studio>
-        <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.9 2.9a1.4 1.4 0 0 1 2 2L6.4 11.4l-2.7.7.7-2.7z"/><path d="M9.6 4.2l2 2"/></svg>
-        <span>Studio</span>
-      </button>
-    </div>
-    <div class="meta"><span class="size"></span><span class="format">PNG</span></div>
-    <p class="note" hidden></p>
-  </div>`
+  </div>
+  <p class="note" hidden></p>
+</div>`
   document.documentElement.appendChild(host)
 
-  const panel = shadow.querySelector('.panel') as HTMLDivElement
-  const picture = shadow.querySelector('.picture') as HTMLDivElement
+  const panel = shadow.querySelector('.wrap') as HTMLDivElement
   const working = shadow.querySelector('.working') as HTMLDivElement
   const more = shadow.querySelector('.more') as HTMLDivElement
   const note = shadow.querySelector('.note') as HTMLParagraphElement
   const copyButton = shadow.querySelector('[data-copy]') as HTMLButtonElement
+  const saveButton = shadow.querySelector('[data-save-main]') as HTMLButtonElement
   const studioButton = shadow.querySelector('[data-studio]') as HTMLButtonElement
-  const previewButton = shadow.querySelector('.preview') as HTMLButtonElement
-  const size = shadow.querySelector('.size') as HTMLSpanElement
-  size.textContent = `${payload.width} × ${payload.height}`
 
-  // The clipboard is only reachable from a secure context, so a plain http page is
-  // told where copying works rather than left with a button that quietly fails.
   const canCopy = window.isSecureContext && typeof navigator.clipboard?.write === 'function'
   if (!canCopy) {
     copyButton.disabled = true
@@ -562,8 +545,6 @@ async function showCapturePanel(payload: CapturePanelPayload): Promise<void> {
     event.stopImmediatePropagation()
     close()
   }
-  // A screenshot the user walks away from should not sit on the page forever, but the
-  // countdown holds while they are reading or reaching for the buttons.
   const armDismiss = (delay: number) => {
     clearTimeout(dismissTimer)
     dismissTimer = window.setTimeout(close, delay)
@@ -572,39 +553,29 @@ async function showCapturePanel(payload: CapturePanelPayload): Promise<void> {
   panel.addEventListener('pointerenter', () => armDismiss(120000))
   panel.addEventListener('pointerleave', () => armDismiss(9000))
   armDismiss(30000)
-  shadow.querySelector('.close')?.addEventListener('click', close)
+  shadow.querySelector('[data-close]')?.addEventListener('click', close)
 
   const openStudio = () => {
     close()
     chrome.runtime.sendMessage({ type: 'IMAGESHOT_OPEN_STUDIO', id: payload.id })?.catch?.(() => undefined)
   }
-  // The picture is the obvious way into the editor, so it is a target too.
   studioButton.addEventListener('click', openStudio)
-  previewButton.addEventListener('click', openStudio)
 
-  // Chrome caps a 2D canvas near 32,767 px a side and around 48 megapixels, and the
-  // same limits decide the scale the Studio would compose at.
   const fitScale = (width: number, height: number) => {
     if (!(width > 0) || !(height > 0)) return 1
     return Math.min(1, Math.sqrt(48_000_000 / (width * height)), 32_000 / width, 32_000 / height)
   }
-
   const drawTile = (context: CanvasRenderingContext2D, image: CanvasImageSource, tile: { sourceX: number; sourceY: number; sourceWidth: number; sourceHeight: number; x: number; y: number; width: number; height: number }, scale: number) => {
-    // Each edge scales on its own, the way the capture loop places tiles, so
-    // neighbours stay flush and no seam opens between them.
     const x = Math.round(tile.x * scale)
     const y = Math.round(tile.y * scale)
     context.drawImage(image, tile.sourceX, tile.sourceY, tile.sourceWidth, tile.sourceHeight, x, y, Math.max(1, Math.round((tile.x + tile.width) * scale) - x), Math.max(1, Math.round((tile.y + tile.height) * scale) - y))
   }
-
   const decode = async (dataUrl: string) => {
     const image = new Image()
     image.src = dataUrl
     await image.decode()
     return image
   }
-
-  /** The full capture as a PNG, for the clipboard. */
   const compose = async (): Promise<Blob> => {
     if (payload.dataUrl) return await (await fetch(payload.dataUrl)).blob()
     const tiles = payload.tiles ?? []
@@ -632,51 +603,57 @@ async function showCapturePanel(payload: CapturePanelPayload): Promise<void> {
     }
   }
 
-  // Register actions before decoding the preview: a long capture must not leave a
-  // visible Copy button waiting for images that are outside the preview frame.
   copyButton.addEventListener('click', () => {
-    const glyph = copyButton.querySelector('svg') as SVGElement
-    const label = copyButton.querySelector('span') as HTMLElement
     copyButton.disabled = true
-    label.textContent = 'Copying…'
-    // Keep clipboard permission attached to this gesture while the PNG is prepared.
+    copyButton.textContent = 'Copying…'
     const pending = compose()
     navigator.clipboard.write([new ClipboardItem({ 'image/png': pending })]).then(
       () => {
-        glyph.outerHTML = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3.2 8.4l3.1 3.1 6.5-6.9"/></svg>'
-        label.textContent = 'Copied'
-        window.setTimeout(close, 1400)
+        copyButton.textContent = 'Copied'
+        window.setTimeout(close, 900)
       },
       () => {
         copyButton.disabled = false
-        label.textContent = 'Copy'
+        copyButton.textContent = 'Copy'
         note.hidden = false
         note.textContent = 'The browser would not copy this image. Open in Studio to copy it there.'
       },
     )
   })
 
+  saveButton.addEventListener('click', async () => {
+    saveButton.disabled = true
+    saveButton.textContent = 'Saving…'
+    try {
+      const blob = await compose()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'imageshot-' + Date.now() + '.png'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      saveButton.textContent = 'Saved'
+      window.setTimeout(close, 800)
+    } catch {
+      saveButton.disabled = false
+      saveButton.textContent = 'Save'
+    }
+  })
+
   try {
-    // Draw straight into a small canvas without encoding another preview image.
-    //
-    // A page much taller than it is wide would letterbox down to a sliver nobody can
-    // read, so past that point it shows the top at a usable width and admits there is
-    // more below. Copying and the Studio still carry the whole thing.
-    const FRAME_WIDTH = 278
-    const FRAME_HEIGHT = 154
-    const ratio = payload.width / payload.height
-    const clipped = ratio < 0.62 && payload.height > FRAME_HEIGHT
-    const scale = Math.min(1, FRAME_WIDTH / payload.width, clipped ? Infinity : FRAME_HEIGHT / payload.height)
+    const FRAME_W = 250
+    const FRAME_H = 200
+    const scale = Math.min(FRAME_W / payload.width, FRAME_H / payload.height, 1)
     const displayWidth = Math.max(1, Math.floor(payload.width * scale))
-    const displayHeight = clipped ? FRAME_HEIGHT : Math.max(1, Math.floor(payload.height * scale))
-    // CSS pixels are larger than screenshot pixels on Retina displays and at browser
-    // zoom. Keep a separate backing size, capped at the original capture resolution.
-    const pixelRatio = Math.min(Math.max(1, window.devicePixelRatio || 1), 1 / scale)
+    const displayHeight = Math.max(1, Math.floor(payload.height * scale))
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2)
     const canvas = document.createElement('canvas')
     canvas.width = Math.max(1, Math.round(displayWidth * pixelRatio))
     canvas.height = Math.max(1, Math.round(displayHeight * pixelRatio))
-    canvas.style.width = `${displayWidth}px`
-    canvas.style.height = `${displayHeight}px`
+    canvas.style.width = displayWidth + 'px'
+    canvas.style.height = displayHeight + 'px'
     const context = canvas.getContext('2d', { alpha: false })
     if (!context) throw new Error('The browser could not create the screenshot canvas.')
     context.imageSmoothingQuality = 'high'
@@ -686,13 +663,10 @@ async function showCapturePanel(payload: CapturePanelPayload): Promise<void> {
     if (payload.dataUrl) {
       const image = await decode(payload.dataUrl)
       if (!host.isConnected) { image.src = ''; return }
-      // Only the top slice is shown when the frame is cropped; the copy keeps it all.
-      const shown = clipped ? Math.min(payload.height, canvas.height / renderScale) : payload.height
-      context.drawImage(image, 0, 0, payload.width, shown, 0, 0, canvas.width, canvas.height)
+      context.drawImage(image, 0, 0, payload.width, payload.height, 0, 0, canvas.width, canvas.height)
       image.src = ''
     } else {
       for (const tile of payload.tiles ?? []) {
-        // A tall-page pin shows only its top; decoding the rest cannot affect it.
         if (tile.y * renderScale >= canvas.height || tile.x * renderScale >= canvas.width) continue
         const image = await decode(tile.dataUrl)
         if (!host.isConnected) { image.src = ''; return }
@@ -700,15 +674,14 @@ async function showCapturePanel(payload: CapturePanelPayload): Promise<void> {
         image.src = ''
       }
     }
-    // Named for what it is rather than the page it came from.
     canvas.setAttribute('role', 'img')
-    canvas.setAttribute('aria-label', `Screenshot, ${payload.width} by ${payload.height} pixels`)
+    canvas.setAttribute('aria-label', 'Screenshot, ' + payload.width + ' by ' + payload.height + ' pixels')
     working.replaceWith(canvas)
-    if (clipped) more.hidden = false
   } catch {
     working.textContent = 'The preview could not be drawn.'
   }
 }
+
 
 /** Shows the finished capture on the page it was taken from. */
 async function openCapturePanel(tabId: number, record: CaptureRecord): Promise<void> {

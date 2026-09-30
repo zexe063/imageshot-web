@@ -1,116 +1,118 @@
 import React, { useEffect, useState } from 'react';
 import ReactDOM from 'react-dom/client';
-import { Brand, Icon, type IconName } from './components/Icon';
-import { Segmented } from './components/ui';
+import { Icon, type IconName } from './components/Icon';
 import type { CaptureMode } from './lib/capture-store';
 import { readCaptureDestination, writeCaptureDestination, type CaptureDestination } from './extension/preferences';
 import './styles.css';
 
-/** One word fits a stacked toolbar; the full name stays the accessible label. */
-const MODES: { id: CaptureMode; icon: IconName; label: string; text: string }[] = [
-  { id: 'visible', icon: 'display', label: 'Visible', text: 'the current viewport' },
-  { id: 'full', icon: 'full', label: 'Fullpage', text: 'the whole webpage' },
-  { id: 'area', icon: 'crop', label: 'Area', text: 'a region you drag out' },
+const MODES: { id: CaptureMode; icon: IconName; label: string }[] = [
+  { id: 'area', icon: 'radius', label: 'Area' },
+  { id: 'visible', icon: 'visible', label: 'Display' },
+  { id: 'full', icon: 'page', label: 'Full page' },
 ];
-const NAMES: Record<CaptureMode, string> = { visible: 'Visible page', full: 'Full page', area: 'Select area' };
 
 function Popup() {
   const [busy, setBusy] = useState<CaptureMode | null>(null);
+  const [selected, setSelected] = useState<CaptureMode>('full');
   const [error, setError] = useState('');
-  const [destination, setDestination] = useState<CaptureDestination | null>(null);
-  const extension = typeof chrome !== 'undefined' && Boolean(chrome.runtime?.id);
-  useEffect(() => { void readCaptureDestination().then(setDestination); }, []);
+  const extension = typeof globalThis.chrome !== 'undefined' && Boolean(globalThis.chrome.runtime?.id);
+
+  // DEFAULT = PINNED - so preview shows on same page, not editor
+  useEffect(() => { 
+    readCaptureDestination().then((d) => {
+      if (!d) {
+        // first time - set to panel and save it
+        writeCaptureDestination('panel').catch(()=>{});
+      }
+    }).catch(()=>{});
+    // force default to panel so it never goes to editor
+    writeCaptureDestination('panel').catch(()=>{});
+  }, []);
+
   async function capture(mode: CaptureMode) {
-    if (!extension) { setError('Load the dist folder as an unpacked extension in Chrome or Edge to capture a webpage. You can try the editor below.'); return; }
-    setError(''); setBusy(mode);
+    setSelected(mode);
+    if (!extension) {
+      setError('Load the dist folder as unpacked extension to capture.');
+      return;
+    }
+    // Ensure it stays pinned - prevent going to editor
+    await writeCaptureDestination('panel').catch(()=>{});
+    
+    setError('');
+    setBusy(mode);
+    
     let closeTimer: ReturnType<typeof window.setTimeout> | undefined;
     try {
       const promise = chrome.runtime.sendMessage({ type: 'IMAGESHOT_CAPTURE', mode });
-      // The capture takes over the page and reports back on the page itself, so the
-      // popup steps aside rather than sitting on top of the thing being captured.
+      // popup steps aside so it doesn't capture itself
       closeTimer = window.setTimeout(() => window.close(), 150);
       const result = await promise;
-      if (!result?.ok) setError(result?.error || 'Capture could not finish. Try again on a regular webpage.');
-      else window.close();
-    } catch (e) { setError(e instanceof Error ? e.message : 'Something went wrong. Please try again.'); }
-    finally { window.clearTimeout(closeTimer); setBusy(null); }
+      
+      if (!result?.ok) {
+        window.clearTimeout(closeTimer);
+        setError(result?.error || 'Capture failed. Try on a regular webpage.');
+        setBusy(null);
+      } else {
+        window.close();
+      }
+    } catch (e) {
+      window.clearTimeout(closeTimer);
+      setError(e instanceof Error ? e.message : 'Something went wrong.');
+      setBusy(null);
+    }
   }
-  function openEditor() {
-    if (extension) chrome.tabs.create({ url: chrome.runtime.getURL('editor.html') });
-    else window.open('./editor.html', '_blank');
+
+  function openSetting() {
+    // Just setting - do not touch destination logic
+    if (extension && chrome.runtime.openOptionsPage) {
+      chrome.runtime.openOptionsPage();
+    }
   }
-  function chooseDestination(next: CaptureDestination) {
-    setDestination(next);
-    void writeCaptureDestination(next);
-  }
-  const current = MODES.find(m => m.id === busy);
-  return <div className="w-[336px] overflow-hidden bg-surface text-app">
-    <header className="flex items-center justify-between h-[54px] px-4 border-b border-line">
-      <Brand small />
-      <span className="inline-flex items-center gap-[5px] px-2 py-[4px] border border-line rounded-full bg-panel text-ink-2 text-[10px] font-medium"><Icon name="image" size={13} />Screenshot</span>
-    </header>
 
-    <main className="p-3.5 flex flex-col gap-2.5">
-      <Segmented
-        layout="stacked"
-        label="Capture options"
-        // The raised card marks the type to use unless another is chosen, and follows
-        // the capture in flight.
-        value={busy ?? 'visible'}
-        busy={!!busy}
-        disabled={!!busy}
-        options={MODES.map(m => ({ value: m.id, label: busy === m.id ? 'Capturing…' : m.label, icon: busy === m.id ? 'reset' : m.icon, name: NAMES[m.id] }))}
-        onChange={value => capture(value as CaptureMode)}
-      />
+  return (
+    <div className="w-fit bg-transparent">
+      {/* CLEAN HORIZONTAL BAR */}
+      <div className="inline-flex items-center gap-1 p-1 rounded-[13px] bg-white border border-black/[0.08] shadow-[0_4px_16px_rgba(0,0,0,.10),0_1px_2px_rgba(0,0,0,.06)]">
+        
+        {MODES.map((mode) => {
+          const isSelected = selected === mode.id;
+          const running = busy === mode.id;
+          return (
+            <button
+              key={mode.id}
+              onClick={() => capture(mode.id)}
+              disabled={!!busy}
+              aria-pressed={isSelected}
+              aria-busy={running}
+              className={`flex flex-col items-center justify-center gap-1 min-w-[72px] px-3 py-[7px] rounded-[9px] transition-colors duration-150 disabled:cursor-wait disabled:opacity-60
+                ${isSelected ? 'bg-[#EFEFF0] text-[#1D1D1F]' : 'text-[#8E8E93] hover:text-[#1D1D1F] hover:bg-black/[0.04]'}
+              `}
+            >
+              <Icon name={running ? 'reset' : mode.icon} size={18} strokeWidth={isSelected ? 1.9 : 1.6} className={running ? 'animate-spin' : ''} />
+              <span className="text-[11px] font-medium leading-none tracking-[-0.01em]">{running ? 'Capturing' : mode.label}</span>
+            </button>
+          );
+        })}
 
-      <p className="flex items-center justify-center h-[15px] px-1 text-[10.5px] leading-none text-center text-ink-2 whitespace-nowrap" role="status" aria-live="polite">
-        {current ? `Capturing ${current.text}` : 'Visible, full page, or a region you drag out'}
-      </p>
+        <div className="w-px h-[28px] bg-black/[0.08] mx-0.5" />
 
-      {destination && extension && (
-        <div className="flex items-start gap-2.5 -mx-0.5 px-1 py-1.5" role="group" aria-label="After a capture">
-          <input
-            type="checkbox"
-            id="quick-copy"
-            className="mt-[1px] w-[13px] h-[13px] accent-[#6244e0] shrink-0 cursor-pointer"
-            checked={destination === 'panel'}
-            disabled={!!busy}
-            onChange={event => chooseDestination(event.target.checked ? 'panel' : 'studio')}
-          />
-          <label htmlFor="quick-copy" className="flex flex-col gap-[2px] min-w-0 cursor-pointer select-none">
-            <span className="text-[11.5px] font-medium leading-none text-ink">Copy without leaving the page</span>
-            <span className="text-[10px] leading-[1.5] text-ink-2">
-              {destination === 'panel'
-                ? 'Your screenshot appears on the page with a copy button.'
-                : 'Your screenshot opens straight in the Studio.'}
-            </span>
-          </label>
-        </div>
+        {/* LAST OPTION = ONLY SETTING */}
+        <button
+          onClick={openSetting}
+          className="flex flex-col items-center justify-center gap-1 min-w-[56px] px-2 py-[7px] rounded-[9px] text-[#8E8E93] hover:text-[#1D1D1F] hover:bg-black/[0.04] transition-colors"
+        >
+          <Icon name="setting" size={18} strokeWidth={1.6} />
+          <span className="text-[11px] font-medium leading-none">Setting</span>
+        </button>
+      </div>
+
+      {error && (
+        <p className="max-w-[320px] px-3 py-2 rounded-[8px] bg-[#fff7f5] border border-[#f1d3cc] text-[#9b493b] text-[11px] leading-[1.5]">
+          {error}
+        </p>
       )}
-
-      <button
-        type="button"
-        className="group flex items-center gap-2.5 w-full px-2.5 py-2 rounded-[9px] border border-line bg-surface text-left transition-[border-color,background,box-shadow] duration-150 enabled:hover:border-ink-4 enabled:hover:shadow-[0_1px_3px_rgba(0,0,0,.06)] enabled:active:bg-field disabled:cursor-wait disabled:opacity-50"
-        onClick={openEditor}
-        disabled={!!busy}
-        aria-label="Open editor"
-        aria-describedby="open-editor-description"
-      >
-        <span className="grid place-items-center w-[30px] h-[30px] rounded-[7px] bg-field text-ink-2 transition-colors group-hover:text-ink"><Icon name="image" size={16} /></span>
-        <span className="flex flex-1 flex-col gap-[1px] min-w-0">
-          <strong className="text-[12px] font-semibold leading-[1.25] text-ink">Open editor</strong>
-          <span id="open-editor-description" className="text-[10.5px] leading-[1.25] text-ink-2">Import, annotate and export an image</span>
-        </span>
-        <Icon name="right" size={14} className="text-ink-3 transition-transform duration-150 group-hover:translate-x-px" />
-      </button>
-
-      {error && <p role="alert" className="px-3 py-2.5 border border-[#f1d3cc] rounded-[8px] bg-[#fff7f5] text-[#9b493b] text-[11px] leading-[1.55]">{error}</p>}
-    </main>
-
-    <footer className="flex items-center justify-between h-[30px] px-3.5 border-t border-line text-[10px] text-ink-3 bg-panel [&>span]:inline-flex [&>span]:items-center [&>span]:gap-1.5 [&_kbd]:font-normal [&_kbd]:text-[10px] [&_kbd]:text-ink-2 [&_kbd]:tracking-[.02em]">
-      <span><Icon name="keyboard" size={13} /><kbd>Alt + Shift + S</kbd></span>
-      <span><i className="w-1 h-1 rounded-full bg-[#6c967a]" />Saved locally</span>
-    </footer>
-  </div>;
+    </div>
+  );
 }
+
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><Popup /></React.StrictMode>);
