@@ -5,14 +5,17 @@ import LayersPanel from './components/LayersPanel';
 import PropertiesPanel from './components/PropertiesPanel';
 import TopBar, { TOOLS } from './components/TopBar';
 import ExportMenu from './components/ExportMenu';
+import { SettingsDialog } from './components/Settings';
 import { IconButton } from './components/ui';
-import { DEFAULT_STYLE, type Annotation, type ArrowEnds, type ArrowHead, type ArrowStyle, type CompositionStyle, type Tool } from './lib/editor-types';
+import { DEFAULT_STYLE, type Annotation, type ArrowEnds, type ArrowHead, type ArrowStyle, type CompositionStyle, type StepStyle, type TextPreset, type Tool } from './lib/editor-types';
 import { annotationBounds, getCompositionSize, renderComposition } from './lib/render';
 import { selectionBounds, transformAnnotation } from './lib/selection';
 import { layerDisplayName, layerLabel } from './lib/naming';
 import { captureFitScale, getCapture, listCaptures, materializeCapture, type CaptureRecord } from './lib/capture-store';
 import { readDraft, writeDraft, type ShotDocument } from './lib/document-store';
-import { createExportBlob, type ExportFormat, type PdfPageSize } from './lib/export';
+import { copyExport, createExportBlob, type ExportFormat, type PdfPageSize } from './lib/export';
+import { DEFAULT_STEP_SIZE, nextStepNumber, stepNumber } from './lib/steps';
+import { PREFERENCE_KEYS, readAutoCopy, readFileFormat, subscribePreferences } from './extension/preferences';
 
 const toolIcons = TOOLS.reduce<Record<string, IconName>>((map, tool) => ({ ...map, [tool.id]: tool.icon }), {});
 
@@ -28,8 +31,8 @@ function reducedCaptureNotice(capture: CaptureRecord): string {
   if (scale >= 1) return '';
   return `This capture is ${(capture.width * capture.height / 1e6).toFixed(0)} megapixels, so ImageShot opened it at ${Math.round(scale * 100)}% scale to fit your browser's canvas limit. Use Select area for full-resolution crops.`;
 }
-const initialDocument: ShotDocument = { name: 'A little more clarity', imageSrc: './sample-workspace.svg', annotations: [], style: DEFAULT_STYLE, sample: true };
-type Dialog = 'capture' | 'shortcuts' | 'recent' | null;
+const initialDocument: ShotDocument = { name: 'A little more clarity', imageSrc: './sample-workspace.svg', annotations: [], style: DEFAULT_STYLE, sample: true, captureId: undefined, nextStepNumber: undefined };
+type Dialog = 'capture' | 'shortcuts' | 'recent' | 'settings' | null;
 
 /** How long an editor that was opened mid-capture waits for its record. */
 const PENDING_CAPTURE_TIMEOUT = 60_000;
@@ -83,6 +86,7 @@ export default function App() {
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   /** The capture image, decoded and waiting to be adopted by the load effect. */
   const decoded = useRef<{ src: string; image: HTMLImageElement } | null>(null);
+  const autoCopiedCapture = useRef<string | null>(null);
   const [ready, setReady] = useState(false);
   const [waiting, setWaiting] = useState(() => !!new URLSearchParams(window.location.search).get('capture'));
   const [past, setPast] = useState<ShotDocument[]>([]);
@@ -93,12 +97,12 @@ export default function App() {
   const setSelectedId = useCallback((id: string | null) => setSelectedIds(id ? [id] : []), []);
   const changeSelection = useCallback((ids: string[]) => setSelectedIds([...new Set(ids)]), []);
   const nudgeDocument = useRef<ShotDocument | null>(null);
-  const [defaults, setDefaults] = useState({ color: '#000000', strokeWidth: 4, fontSize: 32, fontFamily: 'Inter', fontWeight: 600, lineHeight: 1.3, letterSpacing: 0, align: 'left' as NonNullable<Annotation['align']>, fill: null as string | null, radius: 3, opacity: 100, arrowStyle: 'straight' as ArrowStyle, curve: 0, arrowHead: 'chevron' as ArrowHead, arrowEnds: 'head' as ArrowEnds, headSize: 0 });
+  const [defaults, setDefaults] = useState({ color: '#000000', strokeWidth: 4, fontSize: 32, fontFamily: 'Inter', fontWeight: 600, lineHeight: 1.3, letterSpacing: 0, align: 'left' as NonNullable<Annotation['align']>, textPreset: 'standard' as TextPreset, textBackground: '#e5e5e5', textOutline: '#ffffff', blurMode: 'pixelate' as NonNullable<Annotation['blurMode']>, blurAmount: 16, spotlightShape: 'rectangle' as NonNullable<Annotation['spotlightShape']>, spotlightDim: 65, highlightMode: 'text' as NonNullable<Annotation['highlightMode']>, fill: null as string | null, radius: 3, opacity: 100, arrowStyle: 'straight' as ArrowStyle, curve: 0, arrowHead: 'chevron' as ArrowHead, arrowEnds: 'head' as ArrowEnds, headSize: 0, stepSize: DEFAULT_STEP_SIZE, stepStyle: 'filled' as StepStyle });
   const toolDefaults = useRef(new Map<Tool, typeof defaults>());
   function setTool(next: Tool) {
     if (next === tool) return;
     if (tool !== 'select' && tool !== 'crop') toolDefaults.current.set(tool, defaults);
-    if (next !== 'select' && next !== 'crop') setDefaults(toolDefaults.current.get(next) ?? { ...defaults, color: next === 'highlight' ? '#FFE45E' : '#000000', strokeWidth: 4 });
+    if (next !== 'select' && next !== 'crop') setDefaults(toolDefaults.current.get(next) ?? { ...defaults, color: next === 'highlight' ? '#FFE45E' : next === 'number' ? '#e5484d' : '#000000', strokeWidth: 4 });
     setToolState(next);
   }
   const [zoom, setZoom] = useState(1);
@@ -108,17 +112,27 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [toast, setToast] = useState('');
   const [format, setFormat] = useState<ExportFormat>('png');
+  useEffect(() => {
+    let live = true;
+    const syncFormat = () => { void readFileFormat().then(value => { if (live) setFormat(value); }); };
+    syncFormat();
+    const unsubscribe = subscribePreferences(keys => { if (keys.includes(PREFERENCE_KEYS.fileFormat)) syncFormat(); });
+    return () => { live = false; unsubscribe(); };
+  }, []);
   const [exportScale, setExportScale] = useState(1);
   const [pdfPageSize, setPdfPageSize] = useState<PdfPageSize>('auto');
-  const [exporting, setExporting] = useState(false);
+  const [exportAction, setExportAction] = useState<'copy' | 'download' | null>(null);
+  const exporting = exportAction !== null;
   const exportBusy = useRef(false);
   const [exportPreview, setExportPreview] = useState('');
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [recent, setRecent] = useState<CaptureRecord[]>([]);
   const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const selected = doc.annotations.find(a => a.id === selectedId) ?? null;
+  const nextNumber = nextStepNumber(doc.annotations, doc.nextStepNumber);
   const selectedLayers = doc.annotations.filter(annotation => selectedIds.includes(annotation.id));
   const editableLayers = selectedLayers.filter(annotation => !annotation.locked && !annotation.hidden);
   const selectedBounds = selectionBounds(editableLayers) ?? (selected ? annotationBounds(selected) : null);
@@ -198,8 +212,9 @@ export default function App() {
   }
   function duplicateSelected() {
     if (!editableLayers.length) return;
-    const copies = editableLayers.map(annotation => ({ ...annotation, id: crypto.randomUUID(), x: annotation.x + 20, y: annotation.y + 20 }));
-    commit(d => ({ ...d, annotations: [...d.annotations, ...copies] }));
+    let next = nextNumber;
+    const copies = editableLayers.map(annotation => ({ ...annotation, id: crypto.randomUUID(), x: annotation.x + 20, y: annotation.y + 20, ...(annotation.type === 'number' ? { number: next++ } : {}) }));
+    commit(d => ({ ...d, annotations: [...d.annotations, ...copies], ...(next !== nextNumber ? { nextStepNumber: next } : {}) }));
     setSelectedIds(copies.map(annotation => annotation.id));
   }
   function nudgeSelected(key: string, distance: number, repeat: boolean) {
@@ -222,18 +237,27 @@ export default function App() {
       toolDefaults.current.set(selected.type, nextDefaults);
       if (tool === selected.type) setDefaults(nextDefaults);
     }
+    if (selected?.type === 'number' && patch.width !== undefined) {
+      const nextDefaults = { ...(toolDefaults.current.get('number') ?? defaults), stepSize: patch.width };
+      toolDefaults.current.set('number', nextDefaults);
+      if (tool === 'number') setDefaults(nextDefaults);
+    }
     const boxKeys = ['x', 'y', 'width', 'height'];
     const geometryChanged = boxKeys.some(key => key in patch);
     commit(d => {
       const current = selectionBounds(d.annotations.filter(annotation => ids.has(annotation.id)));
       if (!current) return d;
       const box = { x: patch.x ?? current.x, y: patch.y ?? current.y, width: Math.max(1, patch.width ?? current.width), height: Math.max(1, patch.height ?? current.height) };
-      return { ...d, annotations: d.annotations.map(annotation => {
+      return { ...d, ...(patch.number !== undefined && selected?.type === 'number' ? { nextStepNumber: Math.max(nextStepNumber(d.annotations, d.nextStepNumber), stepNumber(patch.number) + 1) } : {}), annotations: d.annotations.map(annotation => {
         if (!ids.has(annotation.id)) return annotation;
         const compatible = Object.fromEntries(Object.entries(patch).filter(([key]) => {
           if (boxKeys.includes(key)) return false;
-          if (['fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'letterSpacing', 'align', 'text'].includes(key)) return annotation.type === 'text';
+          if (['fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'letterSpacing', 'align', 'text', 'textPreset', 'textBackground', 'textOutline'].includes(key)) return annotation.type === 'text';
+          if (['blurMode', 'blurAmount'].includes(key)) return annotation.type === 'blur';
+          if (['spotlightShape', 'spotlightDim'].includes(key)) return annotation.type === 'spotlight';
+          if (key === 'highlightMode') return annotation.type === 'highlight';
           if (['arrowStyle', 'curve', 'arrowHead', 'arrowEnds', 'headSize'].includes(key)) return annotation.type === 'arrow';
+          if (['number', 'stepStyle'].includes(key)) return annotation.type === 'number';
           if (key === 'fill') return annotation.type === 'rectangle' || annotation.type === 'ellipse';
           if (key === 'radius') return annotation.type === 'rectangle';
           return ['color', 'strokeColor', 'strokeWidth', 'opacity'].includes(key);
@@ -282,10 +306,32 @@ export default function App() {
             imageSrc: src,
             sample: false,
             captureId: id,
-            ...(draft ? { annotations: draft.annotations, style: { ...DEFAULT_STYLE, ...draft.style } } : {}),
+            ...(draft ? { annotations: draft.annotations, style: { ...DEFAULT_STYLE, ...draft.style }, nextStepNumber: draft.nextStepNumber } : {}),
           });
           const reduced = reducedCaptureNotice(capture);
           if (live && reduced) notify(reduced);
+          // Copy the original capture in the background after the editor can paint.
+          // Loading the sample, an import, or a self-contained edited draft never copies.
+          void (async () => {
+            if (!await readAutoCopy() || !live || autoCopiedCapture.current === id) return;
+            autoCopiedCapture.current = id;
+            await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+            if (!live) return;
+            let canvas: HTMLCanvasElement | undefined;
+            try {
+              canvas = document.createElement('canvas');
+              canvas.width = composed.naturalWidth; canvas.height = composed.naturalHeight;
+              const context = canvas.getContext('2d');
+              if (!context) throw new Error('The browser could not prepare your screenshot.');
+              context.drawImage(composed, 0, 0);
+              await copyExport(canvas, 'png');
+              if (live) notify('Screenshot copied automatically.');
+            } catch {
+              if (live) notify('Automatic copy was unavailable. Use Copy image to copy your screenshot.');
+            } finally {
+              if (canvas) { canvas.width = 1; canvas.height = 1; }
+            }
+          })();
         } else {
           const draft = await readDraft();
           if (draft && live) setDoc({ ...draft, style: { ...DEFAULT_STYLE, ...draft.style } });
@@ -333,10 +379,13 @@ export default function App() {
   useEffect(() => {
     if (!exportOpen || !image) return;
     let live = true;
+    setPreviewLoading(true);
+    setExportPreview('');
     void (async () => {
       let preview: HTMLCanvasElement | undefined;
       try {
         await document.fonts.ready;
+        await new Promise<void>(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
         if (!live) return;
         preview = renderComposition(image, doc.annotations, doc.style, Math.min(1, 420 / size.width, 260 / size.height));
         setExportPreview(preview.toDataURL('image/png'));
@@ -344,6 +393,7 @@ export default function App() {
         if (live) setExportPreview('');
       } finally {
         if (preview) { preview.width = 1; preview.height = 1; }
+        if (live) setPreviewLoading(false);
       }
     })();
     return () => { live = false; };
@@ -401,7 +451,7 @@ export default function App() {
       if (probe.naturalWidth * probe.naturalHeight > 48_000_000 || Math.max(probe.naturalWidth, probe.naturalHeight) > 32760) {
         throw new Error('This image is too large. Keep it under 48 megapixels and 32,760 pixels on either side.');
       }
-      commit({ imageSrc: dataUrl, name: file.name.replace(/\.[^.]+$/, ''), annotations: [], sample: false, captureId: undefined });
+      commit({ imageSrc: dataUrl, name: file.name.replace(/\.[^.]+$/, ''), annotations: [], sample: false, captureId: undefined, nextStepNumber: undefined });
       setSelectedId(null);
       setZoom(1);
       notify('Image imported.');
@@ -412,7 +462,7 @@ export default function App() {
 
   useEffect(() => {
     const onPaste = (event: ClipboardEvent) => {
-      if ((event.target as HTMLElement)?.closest('input,textarea')) return;
+      if (dialog || event.defaultPrevented || (event.target as HTMLElement)?.closest('input,textarea,select,[contenteditable="true"]')) return;
       const file = [...(event.clipboardData?.files ?? [])].find(item => item.type.startsWith('image/'));
       if (file) { event.preventDefault(); void importFile(file); }
     };
@@ -423,9 +473,10 @@ export default function App() {
   async function exportImage(copy = false) {
     if (!image || exportBusy.current) return;
     exportBusy.current = true;
-    setExporting(true);
+    setExportAction(copy ? 'copy' : 'download');
+    const snapshot = docRef.current;
     try {
-      const outputSize = getCompositionSize(image, doc.style);
+      const outputSize = getCompositionSize(image, snapshot.style);
       const scale = copy ? 1 : exportScale;
       if (outputSize.width * outputSize.height * scale ** 2 > 64_000_000 || Math.max(outputSize.width, outputSize.height) * scale > 32760) {
         throw new Error('This export is too large. Reduce the export scale or the canvas padding.');
@@ -434,11 +485,9 @@ export default function App() {
         let canvas: HTMLCanvasElement | undefined;
         try {
           await document.fonts.ready;
-          if (outputFormat === 'pdf') {
-            // Give the working indicator a paint before rendering and encoding.
-            await new Promise<void>(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
-          }
-          canvas = renderComposition(image, doc.annotations, doc.style, scale);
+          // Paint the button loader before every format starts its expensive work.
+          await new Promise<void>(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+          canvas = renderComposition(image, snapshot.annotations, snapshot.style, scale);
           return await createExportBlob(canvas, outputFormat, { pageSize: pdfPageSize, originalSize: outputSize });
         } finally {
           if (canvas) { canvas.width = 1; canvas.height = 1; }
@@ -456,7 +505,7 @@ export default function App() {
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement('a');
         anchor.href = url;
-        anchor.download = `${doc.name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '-').trim() || 'imageshot'}.${format}`;
+        anchor.download = `${snapshot.name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '-').trim() || 'imageshot'}.${format}`;
         anchor.click();
         setTimeout(() => URL.revokeObjectURL(url), 10000);
         setExportOpen(false);
@@ -466,7 +515,7 @@ export default function App() {
       notify(error instanceof Error ? error.message : 'Export failed. Try PNG at 1×.');
     } finally {
       exportBusy.current = false;
-      setExporting(false);
+      setExportAction(null);
     }
   }
 
@@ -475,7 +524,7 @@ export default function App() {
       const saved = await readDraft(`capture:${capture.id}`);
       // A saved draft may hold no image, because a capture's is rebuilt on open.
       const imageSrc = saved?.imageSrc || (await materializeCapture(capture)).src;
-      commit(saved ? { ...saved, imageSrc, style: { ...DEFAULT_STYLE, ...saved.style } } : { imageSrc, name: capture.name, annotations: [], style: DEFAULT_STYLE, sample: false, captureId: capture.id });
+      commit(saved ? { ...saved, imageSrc, style: { ...DEFAULT_STYLE, ...saved.style }, nextStepNumber: saved.nextStepNumber } : { imageSrc, name: capture.name, annotations: [], style: DEFAULT_STYLE, sample: false, captureId: capture.id, nextStepNumber: undefined });
       const reduced = reducedCaptureNotice(capture);
       if (reduced) notify(reduced);
       setDialog(null);
@@ -501,9 +550,9 @@ export default function App() {
     <div
       className={`relative flex flex-col h-dvh bg-canvas ${
         dragging ? "after:content-[''] after:absolute after:inset-1.5 after:z-[60] after:border-2 after:border-dashed after:border-accent after:rounded-[10px] after:bg-accent/5 after:pointer-events-none" : ''}`}
-      onDragOver={event => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); setDragging(true); } }}
+      onDragOver={event => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); if (!dialog) setDragging(true); } }}
       onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }}
-      onDrop={event => { if (event.dataTransfer.files.length) { event.preventDefault(); setDragging(false); void importFile(event.dataTransfer.files[0]); } }}
+      onDrop={event => { if (event.dataTransfer.files.length) { event.preventDefault(); setDragging(false); if (!dialog) void importFile(event.dataTransfer.files[0]); } }}
     >
       <input
         type="file"
@@ -518,12 +567,15 @@ export default function App() {
         tool={tool}
         exportOpen={exportOpen}
         exporting={exporting}
+        copying={exportAction === 'copy'}
+        ready={!!image}
         onToggleMenu={() => setMenuOpen(value => !value)}
         onImport={() => fileInput.current?.click()}
         onCapture={() => { setDialog('capture'); setMenuOpen(false); }}
         onRecent={() => { setDialog('recent'); setMenuOpen(false); }}
         onSample={() => { commit(initialDocument); setMenuOpen(false); setZoom(1); }}
         onShortcuts={() => { setDialog('shortcuts'); setMenuOpen(false); }}
+        onSettings={() => { setDialog('settings'); setMenuOpen(false); }}
         onTool={next => { if (next !== 'select') setSelectedId(null); setTool(next); }}
         zoom={zoom}
         actualZoom={actualZoom}
@@ -541,6 +593,8 @@ export default function App() {
             height={size.height}
             preview={exportPreview}
             exporting={exporting}
+            copying={exportAction === 'copy'}
+            previewLoading={previewLoading}
             ready={!!image}
             onFormat={next => { setFormat(next); if (next === 'pdf') setExportScale(current => Math.max(1, current)); }}
             onScale={setExportScale}
@@ -551,6 +605,8 @@ export default function App() {
           />
         )}
       />
+
+      <span role="status" className="sr-only">{exportAction === 'copy' ? 'Copying image…' : exportAction === 'download' ? 'Preparing export…' : ''}</span>
 
       <div className="flex flex-1 min-h-0">
         <LayersPanel
@@ -572,7 +628,11 @@ export default function App() {
             <EditorCanvas
               image={image}
               annotations={doc.annotations}
-              onChange={annotations => commit({ annotations })}
+              onChange={annotations => commit(d => {
+                const ids = new Set(d.annotations.map(annotation => annotation.id));
+                const placed = [...annotations].reverse().find(annotation => annotation.type === 'number' && !ids.has(annotation.id));
+                return { ...d, annotations, ...(placed ? { nextStepNumber: stepNumber(placed.number) + 1 } : {}) };
+              })}
               selectedId={selectedId}
               selectedIds={selectedIds}
               onSelect={setSelectedId}
@@ -584,6 +644,8 @@ export default function App() {
               onArrowChange={sendArrow}
               textSize={defaults.fontSize}
               textStyle={defaults}
+              step={defaults}
+              nextStepNumber={nextNumber}
               style={doc.style}
               zoom={zoom}
               onToolChange={setTool}
@@ -605,10 +667,14 @@ export default function App() {
           onStyle={changeStyle}
           onLayer={patchLayer}
           onDefaults={patch => setDefaults(current => ({ ...current, ...patch }))}
+          nextStepNumber={nextNumber}
+          onNextStepNumber={value => commit({ nextStepNumber: value })}
           onDuplicate={duplicateSelected}
           onDelete={deleteSelected}
         />
       </div>
+
+      {dialog === 'settings' && <SettingsDialog onClose={() => setDialog(null)} />}
 
       {dialog === 'capture' && (
         <Modal title="Capture a screenshot" subtitle="Capture a webpage with ImageShot, or import an image." onClose={() => setDialog(null)}>
@@ -674,7 +740,7 @@ export default function App() {
       )}
 
       {toast && (
-        <div role="status" className="fixed left-1/2 bottom-11 -translate-x-1/2 z-[300] flex items-center gap-2 max-w-[min(520px,calc(100vw-24px))] py-2 pl-3 pr-2 rounded-lg bg-ink text-white text-app shadow-[0_10px_28px_rgba(0,0,0,.28)]">
+        <div role="status" className="fixed left-1/2 bottom-11 -translate-x-1/2 z-[300] flex items-center gap-2 max-w-[min(520px,calc(100vw-24px))] py-2 pl-3 pr-2 rounded-lg bg-ink text-surface text-app shadow-[0_10px_28px_rgba(0,0,0,.28)]">
           <Icon name="info" size={16} className="text-[#b9b4cc]" />
           <span>{toast}</span>
           <IconButton icon="close" label="Dismiss notification" size={22} iconSize={13} tone="inverse" onClick={() => setToast('')} />

@@ -1,7 +1,7 @@
 @import 'tailwindcss';
 
 /* ==========================================================================
-   ImageShot studio — Figma inspired light theme
+   ImageShot studio — shared appearance tokens
    Tailwind v4 holds the design tokens; every component styles itself with
    utilities. Only global defaults, the two webfonts and one keyframe live here.
    ========================================================================== */
@@ -23,6 +23,8 @@
 }
 
 @theme {
+  /* Tailwind preflight also applies its sans face to html and native dialogs. */
+  --font-sans: 'Geist Variable', 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-ui: 'Geist Variable', 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-canvas: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 
@@ -48,6 +50,8 @@
   --color-accent-soft-hover: #ddd6fa;
   --color-accent-ink: #4a2fb4;
   --color-danger: #f24822;
+  --color-toast: #1e1e1e;
+  --color-toast-ink: #ffffff;
 
   --text-app: 11px;
   --radius-control: 6px;
@@ -70,12 +74,36 @@
 
 @layer base {
   /* Both panels and the top bar grid read these, so the columns can never drift. */
-  :root { --left-w: 244px; --right-w: 268px; }
+  :root { --left-w: 244px; --right-w: 268px; color-scheme: light; }
+  :root[data-theme='dark'] {
+    color-scheme: dark;
+    --color-app: #ededf0;
+    --color-panel: #19191d;
+    --color-surface: #222227;
+    --color-canvas: #111114;
+    --color-line: #3a3a42;
+    --color-line-soft: #303037;
+    --color-field: #303037;
+    --color-field-hover: #3c3c45;
+    --color-ink: #ededf0;
+    --color-ink-2: #aaaab6;
+    --color-ink-3: #82828f;
+    --color-ink-4: #565663;
+    --color-accent: #8063f1;
+    --color-accent-hover: #9075fc;
+    --color-accent-soft: #393054;
+    --color-accent-soft-hover: #453963;
+    --color-accent-ink: #c4b5ff;
+    --color-danger: #ff9178;
+    --color-toast: #ececf2;
+    --color-toast-ink: #202026;
+  }
   @media (max-width: 1320px) { :root { --left-w: 216px; --right-w: 252px; } }
   @media (max-width: 1160px) { :root { --left-w: 196px; --right-w: 240px; } }
   @media (max-width: 760px) { :root { --right-w: 218px; } }
 
   html, body, #root { height: 100%; }
+  html, dialog { font-family: var(--font-ui); }
 
   body {
     margin: 0;
@@ -87,7 +115,8 @@
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     color: var(--color-ink);
-    color-scheme: light;
+    background: var(--color-panel);
+    color-scheme: inherit;
   }
 
   button:not(:disabled) { cursor: pointer; }
@@ -102,4 +131,64 @@
   @media (prefers-reduced-motion: reduce) {
     *, ::before, ::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
   }
+}
+
+/* The popup can grow into settings without navigating away from its capture bar. */
+html:has(.popup-body), .popup-body, .popup-body #root { width: fit-content; height: auto; min-height: 0; }
+.popup-body { overflow: auto; }
+
+.settings-page { height: 100%; overflow: auto; padding: 32px 20px; background: var(--color-panel); }
+.settings-page > .settings-shell { max-width: 800px; margin: 0 auto; border: 1px solid var(--color-line); border-radius: 14px; box-shadow: 0 12px 48px rgb(0 0 0 / .12); }
+.settings-dialog { margin: auto; padding: 0; width: min(760px, calc(100vw - 32px)); max-height: min(680px, calc(100dvh - 40px)); border: 1px solid var(--color-line); border-radius: 14px; background: var(--color-surface); color: var(--color-ink); box-shadow: 0 24px 80px rgb(0 0 0 / .3); }
+.settings-dialog::backdrop { background: rgb(12 12 18 / .42); backdrop-filter: blur(3px); }
+.settings-shell { background: var(--color-surface); color: var(--color-ink); overflow: hidden; font-size: 12px; }
+.settings-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; border-bottom: 1px solid var(--color-line); }
+.settings-layout { display: grid; grid-template-columns: 150px minmax(0, 1fr); min-height: 394px; }
+.settings-tabs { display: flex; flex-direction: column; gap: 4px; padding: 14px 10px; background: var(--color-panel); border-right: 1px solid var(--color-line); }
+.settings-tabs button { padding: 9px 10px; border-radius: 6px; text-align: left; color: var(--color-ink-2); font-weight: 500; }
+.settings-tabs button:hover { background: var(--color-field-hover); color: var(--color-ink); }
+.settings-tabs button[aria-current] { background: var(--color-accent-soft); color: var(--color-accent-ink); }
+.settings-content { min-width: 0; padding: 22px; overflow: auto; }
+.settings-content h2 { font-size: 14px; font-weight: 600; letter-spacing: -.15px; }
+.settings-description { margin: 6px 0 18px; color: var(--color-ink-2); font-size: 12px; line-height: 1.55; }
+.settings-themes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.settings-themes button { padding: 6px 6px 9px; border: 1px solid var(--color-line); border-radius: 9px; background: var(--color-panel); font-size: 12px; font-weight: 500; }
+.settings-themes button[aria-checked='true'] { border-color: var(--color-accent); box-shadow: 0 0 0 1px var(--color-accent); color: var(--color-accent-ink); }
+.settings-themes button[aria-disabled='true'] { opacity: .5; cursor: wait; }
+.settings-preview { height: 76px; display: flex; flex-direction: column; justify-content: center; gap: 6px; margin-bottom: 10px; padding: 14px; border: 1px solid #dedee4; border-radius: 5px; background: #fff; }
+.settings-preview > span { height: 4px; background: #e1e1e8; border-radius: 2px; }
+.settings-preview > span:nth-child(2) { width: 60%; }
+.settings-preview > span:nth-child(3) { width: 80%; }
+.settings-preview[data-swatch='dark'] { background: #25252c; border-color: #3a3a44; }
+.settings-preview[data-swatch='dark'] > span { background: #53535e; }
+.settings-preview[data-swatch='system'] { background: linear-gradient(90deg, #fff 50%, #25252c 50%); }
+.settings-preview[data-swatch='system'] > span { background: #ababbb; }
+.settings-card { overflow: hidden; border: 1px solid var(--color-line); border-radius: 9px; }
+.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px; }
+.settings-row + .settings-row { border-top: 1px solid var(--color-line-soft); }
+.settings-row select { max-width: 145px; height: 30px; padding: 0 8px; border: 1px solid var(--color-line); border-radius: 6px; background: var(--color-field); color: var(--color-ink); font-size: 11px; flex-shrink: 0; }
+.settings-row select:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.settings-row kbd { flex-shrink: 0; padding: 4px 6px; border: 1px solid var(--color-line); border-radius: 5px; background: var(--color-field); color: var(--color-ink); font: 11px var(--font-ui); }
+.settings-switch { position: relative; width: 36px; height: 21px; flex-shrink: 0; border-radius: 99px; background: var(--color-ink-3); }
+.settings-switch[data-on] { background: var(--color-accent); }
+.settings-switch span { position: absolute; top: 3px; left: 3px; width: 15px; height: 15px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgb(0 0 0 / .2); transition: transform .12s ease; }
+.settings-switch[data-on] span { transform: translateX(15px); }
+.settings-status { min-height: 28px; margin-top: 18px; color: var(--color-ink-2); font-size: 11px; line-height: 1.5; }
+.settings-compact { width: 390px; max-width: 100vw; }
+/* Chrome sizes the popup from its content; using its old viewport as a maximum
+   would trap the settings at the width of the smaller capture toolbar. */
+.popup-body .settings-compact { max-width: none; }
+.settings-compact .settings-header { padding: 14px 16px; }
+.settings-compact .settings-layout { display: flex; flex-direction: column; min-height: 398px; }
+.settings-compact .settings-tabs { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--color-line); padding: 8px; gap: 2px; }
+.settings-compact .settings-tabs button { flex: 1; padding: 8px 5px; text-align: center; font-size: 11px; }
+.settings-compact .settings-content { max-height: 454px; padding: 18px 16px 8px; }
+.settings-compact .settings-row { padding: 12px; gap: 12px; }
+.settings-compact .settings-preview { height: 65px; }
+@media (max-width: 580px) {
+  .settings-dialog .settings-layout, .settings-page .settings-layout { display: flex; flex-direction: column; }
+  .settings-dialog .settings-tabs, .settings-page .settings-tabs { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--color-line); gap: 2px; padding: 8px; }
+  .settings-dialog .settings-tabs button, .settings-page .settings-tabs button { flex: 1; padding: 8px 4px; text-align: center; font-size: 11px; }
+  .settings-content { padding: 18px 14px; }
+  .settings-themes { gap: 8px; }
 }

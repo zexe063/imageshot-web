@@ -5,6 +5,15 @@ import { hslToRgb, hsvToRgb, parseColor, rgbaToHex, rgbToHsl, rgbToHsv, toCss } 
 
 /* ------------------------------------------------------------------ buttons */
 
+export function Spinner({ size = 15, className = '' }: { size?: number; className?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true" className={`shrink-0 animate-spin ${className}`}>
+      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5" opacity=".25" />
+      <path d="M12 3a9 9 0 0 1 9 9" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function IconButton({
   icon, label, onClick, active = false, disabled = false, size = 28, iconSize = 16, tone = 'default', className = '', children,
 }: {
@@ -16,7 +25,7 @@ export function IconButton({
       type="button"
       data-active={active || undefined}
       data-tone={tone === 'default' ? undefined : tone}
-      className={`inline-flex items-center justify-center rounded-control text-ink-2 shrink-0 enabled:hover:bg-black/[.06] enabled:hover:text-ink data-[active]:bg-accent-soft data-[active]:text-accent-ink data-[tone=muted]:text-ink-3 data-[tone=muted]:enabled:hover:text-ink data-[tone=locked]:text-accent-ink data-[tone=inverse]:text-[#b9b4cc] data-[tone=inverse]:enabled:hover:bg-white/15 data-[tone=inverse]:enabled:hover:text-white ${className}`}
+      className={`inline-flex items-center justify-center rounded-control text-ink-2 shrink-0 enabled:hover:bg-field-hover enabled:hover:text-ink data-[active]:bg-accent-soft data-[active]:text-accent-ink data-[tone=muted]:text-ink-3 data-[tone=muted]:enabled:hover:text-ink data-[tone=locked]:text-accent-ink data-[tone=inverse]:text-surface/70 data-[tone=inverse]:enabled:hover:bg-surface/15 data-[tone=inverse]:enabled:hover:text-surface ${className}`}
       style={{ width: size, height: size }}
       aria-label={label}
       title={label}
@@ -31,17 +40,17 @@ export function IconButton({
 }
 
 export function ActionButton({
-  icon, children, trailing, onClick, variant = 'default', disabled = false, title, ariaLabel, className = '',
+  icon, children, trailing, onClick, variant = 'default', disabled = false, loading = false, title, ariaLabel, className = '',
 }: {
   icon?: IconName; children?: ReactNode; trailing?: ReactNode; onClick?: () => void;
-  variant?: 'default' | 'primary' | 'ghost' | 'danger'; disabled?: boolean; title?: string; ariaLabel?: string; className?: string;
+  variant?: 'default' | 'primary' | 'ghost' | 'danger'; disabled?: boolean; loading?: boolean; title?: string; ariaLabel?: string; className?: string;
 }) {
   return (
     <button
       type="button"
       data-variant={variant}
-      className={`inline-flex items-center justify-center gap-1.5 h-[30px] px-2.5 rounded-control text-app font-medium whitespace-nowrap bg-field text-ink enabled:hover:bg-field-hover data-[variant=primary]:bg-accent data-[variant=primary]:text-white data-[variant=primary]:shadow-[0_1px_2px_rgba(36,20,92,.22)] data-[variant=primary]:enabled:hover:bg-accent-hover data-[variant=ghost]:bg-transparent data-[variant=ghost]:text-ink-2 data-[variant=danger]:bg-field data-[variant=danger]:text-danger ${className}`} onClick={onClick} disabled={disabled} title={title} aria-label={ariaLabel}>
-      {icon ? <Icon name={icon} size={15} /> : null}
+      className={`inline-flex items-center justify-center gap-1.5 h-[30px] px-2.5 rounded-control text-app font-medium whitespace-nowrap bg-field text-ink enabled:hover:bg-field-hover data-[variant=primary]:bg-accent data-[variant=primary]:text-white data-[variant=primary]:shadow-[0_1px_2px_rgba(36,20,92,.22)] data-[variant=primary]:enabled:hover:bg-accent-hover data-[variant=ghost]:bg-transparent data-[variant=ghost]:text-ink-2 data-[variant=danger]:bg-field data-[variant=danger]:text-danger ${className}`} onClick={onClick} disabled={disabled || loading} title={title} aria-label={ariaLabel} aria-busy={loading || undefined}>
+      {loading ? <Spinner /> : icon ? <Icon name={icon} size={15} /> : null}
       {children ? <span className="max-[900px]:hidden">{children}</span> : null}
       {trailing}
     </button>
@@ -58,6 +67,7 @@ export function NumberField({
   placeholder?: string; ariaLabel?: string;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
+  const cancelBlur = useRef(false);
   const display = draft ?? (Number.isFinite(value) ? String(Math.round(value * 1000) / 1000) : '');
   // The input hugs its value so the unit sits right next to the number, like Figma.
   const size = Math.max(2, Math.min(10, display.length || 2));
@@ -79,10 +89,10 @@ export function NumberField({
       aria-label={ariaLabel}
       disabled={disabled}
       onChange={event => setDraft(event.target.value)}
-      onBlur={() => { if (draft !== null) send(draft); setDraft(null); }}
+      onBlur={() => { if (!cancelBlur.current && draft !== null) send(draft); cancelBlur.current = false; setDraft(null); }}
       onKeyDown={event => {
-        if (event.key === 'Enter') { if (draft !== null) send(draft); (event.target as HTMLInputElement).blur(); }
-        if (event.key === 'Escape') { setDraft(null); (event.target as HTMLInputElement).blur(); }
+        if (event.key === 'Enter') { event.preventDefault(); (event.target as HTMLInputElement).blur(); }
+        if (event.key === 'Escape') { event.preventDefault(); cancelBlur.current = true; (event.target as HTMLInputElement).blur(); }
         if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
           event.preventDefault();
           const delta = (event.key === 'ArrowUp' ? 1 : -1) * (event.shiftKey ? 10 : 1) * step;

@@ -1,8 +1,9 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { Icon, type IconName } from './components/Icon';
 import type { CaptureMode } from './lib/capture-store';
-import { readCaptureDestination, writeCaptureDestination, type CaptureDestination } from './extension/preferences';
+import Settings from './components/Settings';
+import { bootstrapTheme } from './lib/theme';
 import './styles.css';
 
 const MODES: { id: CaptureMode; icon: IconName; label: string }[] = [
@@ -15,19 +16,8 @@ function Popup() {
   const [busy, setBusy] = useState<CaptureMode | null>(null);
   const [selected, setSelected] = useState<CaptureMode>('full');
   const [error, setError] = useState('');
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const extension = typeof globalThis.chrome !== 'undefined' && Boolean(globalThis.chrome.runtime?.id);
-
-  // DEFAULT = PINNED - so preview shows on same page, not editor
-  useEffect(() => { 
-    readCaptureDestination().then((d) => {
-      if (!d) {
-        // first time - set to panel and save it
-        writeCaptureDestination('panel').catch(()=>{});
-      }
-    }).catch(()=>{});
-    // force default to panel so it never goes to editor
-    writeCaptureDestination('panel').catch(()=>{});
-  }, []);
 
   async function capture(mode: CaptureMode) {
     setSelected(mode);
@@ -35,9 +25,6 @@ function Popup() {
       setError('Load the dist folder as unpacked extension to capture.');
       return;
     }
-    // Ensure it stays pinned - prevent going to editor
-    await writeCaptureDestination('panel').catch(()=>{});
-    
     setError('');
     setBusy(mode);
     
@@ -62,17 +49,11 @@ function Popup() {
     }
   }
 
-  function openSetting() {
-    // Just setting - do not touch destination logic
-    if (extension && chrome.runtime.openOptionsPage) {
-      chrome.runtime.openOptionsPage();
-    }
-  }
+  if (settingsOpen) return <Settings compact onClose={() => setSettingsOpen(false)} />;
 
   return (
-    <div className="w-fit bg-transparent">
-      {/* CLEAN HORIZONTAL BAR */}
-      <div className="inline-flex items-center gap-1 p-1 rounded-[13px] bg-white border border-black/[0.08] shadow-[0_4px_16px_rgba(0,0,0,.10),0_1px_2px_rgba(0,0,0,.06)]">
+    <div className="w-fit bg-surface text-ink" data-testid="capture-popup">
+      <div className="inline-flex items-center gap-1 p-1 rounded-[13px] bg-surface border border-line shadow-[0_4px_16px_rgba(0,0,0,.10),0_1px_2px_rgba(0,0,0,.06)]">
         
         {MODES.map((mode) => {
           const isSelected = selected === mode.id;
@@ -85,7 +66,7 @@ function Popup() {
               aria-pressed={isSelected}
               aria-busy={running}
               className={`flex flex-col items-center justify-center gap-1 min-w-[72px] px-3 py-[7px] rounded-[9px] transition-colors duration-150 disabled:cursor-wait disabled:opacity-60
-                ${isSelected ? 'bg-[#EFEFF0] text-[#1D1D1F]' : 'text-[#8E8E93] hover:text-[#1D1D1F] hover:bg-black/[0.04]'}
+                ${isSelected ? 'bg-field text-ink' : 'text-ink-2 hover:text-ink hover:bg-field'}
               `}
             >
               <Icon name={running ? 'reset' : mode.icon} size={18} strokeWidth={isSelected ? 1.9 : 1.6} className={running ? 'animate-spin' : ''} />
@@ -94,20 +75,21 @@ function Popup() {
           );
         })}
 
-        <div className="w-px h-[28px] bg-black/[0.08] mx-0.5" />
+        <div className="w-px h-[28px] bg-line mx-0.5" />
 
-        {/* LAST OPTION = ONLY SETTING */}
         <button
-          onClick={openSetting}
-          className="flex flex-col items-center justify-center gap-1 min-w-[56px] px-2 py-[7px] rounded-[9px] text-[#8E8E93] hover:text-[#1D1D1F] hover:bg-black/[0.04] transition-colors"
+          type="button"
+          onClick={() => setSettingsOpen(true)}
+          disabled={!!busy}
+          className="flex flex-col items-center justify-center gap-1 min-w-[56px] px-2 py-[7px] rounded-[9px] text-ink-2 hover:text-ink hover:bg-field transition-colors"
         >
           <Icon name="setting" size={18} strokeWidth={1.6} />
-          <span className="text-[11px] font-medium leading-none">Setting</span>
+          <span className="text-[11px] font-medium leading-none">Settings</span>
         </button>
       </div>
 
       {error && (
-        <p className="max-w-[320px] px-3 py-2 rounded-[8px] bg-[#fff7f5] border border-[#f1d3cc] text-[#9b493b] text-[11px] leading-[1.5]">
+        <p role="alert" className="max-w-[320px] px-3 py-2 rounded-[8px] bg-surface border border-line text-danger text-[11px] leading-[1.5]">
           {error}
         </p>
       )}
@@ -115,4 +97,6 @@ function Popup() {
   );
 }
 
+const stopTheme = bootstrapTheme();
+if (import.meta.hot) import.meta.hot.dispose(stopTheme);
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><Popup /></React.StrictMode>);

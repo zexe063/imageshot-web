@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { Icon } from './Icon';
-import { ActionButton, IconButton, Row, Segmented, Select } from './ui';
+import { ActionButton, IconButton, Row, Segmented, Select, Spinner } from './ui';
 import type { ExportFormat, PdfPageSize } from '../lib/export';
 
 const EXPORT_SCALES = [0.5, 1, 2, 3];
@@ -31,6 +31,8 @@ interface ExportMenuProps {
   height: number;
   preview: string;
   exporting: boolean;
+  copying: boolean;
+  previewLoading: boolean;
   ready: boolean;
   onFormat: (format: ExportFormat) => void;
   onScale: (scale: number) => void;
@@ -41,7 +43,7 @@ interface ExportMenuProps {
 }
 
 export default function ExportMenu({
-  format, scale, pageSize, width, height, preview, exporting, ready, onFormat, onScale, onPageSize, onDownload, onCopy, onClose,
+  format, scale, pageSize, width, height, preview, exporting, copying, previewLoading, ready, onFormat, onScale, onPageSize, onDownload, onCopy, onClose,
 }: ExportMenuProps) {
   const ref = useRef<HTMLDivElement>(null);
   const imageAspect = width > 0 && height > 0 ? width / height : 1;
@@ -75,8 +77,8 @@ export default function ExportMenu({
         <span>Export</span>
         <IconButton icon="close" label="Close export menu" size={24} iconSize={14} onClick={onClose} />
       </div>
-      <div className="grid place-items-center h-[148px] p-3 overflow-hidden bg-canvas bg-[repeating-conic-gradient(#dcdcdc_0_25%,#fff_0_50%)] bg-[length:12px_12px]">
-        {preview ? (
+      <div className="grid place-items-center h-[148px] p-3 overflow-hidden bg-canvas bg-[repeating-conic-gradient(var(--color-line)_0_25%,var(--color-surface)_0_50%)] bg-[length:12px_12px]">
+        {previewLoading ? <span role="status" aria-label="Preparing export preview" className="text-ink-2"><Spinner size={22} /></span> : preview ? (
           <div
             className={`shadow-[0_2px_8px_rgba(0,0,0,.18)] ${format === 'pdf' ? 'bg-white' : ''}`}
             style={{ width: previewWidth, height: previewHeight }}
@@ -113,10 +115,10 @@ export default function ExportMenu({
         </Row>
         {format === 'jpg' ? <p className="text-[10px] leading-[1.5] text-ink-3">JPG has no transparency — transparent areas export as white.</p> : null}
         {format === 'pdf' ? <p className="text-[10px] leading-[1.5] text-ink-3">{PDF_PAGE_HINTS[pageSize]} No stretching or cropping. Scale changes resolution while keeping the page size.</p> : null}
-        <ActionButton icon="download" variant="primary" onClick={onDownload} disabled={exporting || !ready} className="w-full h-8 [&>span]:block" ariaLabel="Download image">
-          {exporting ? 'Preparing…' : `Export ${format.toUpperCase()}`}
+        <ActionButton icon="download" variant="primary" onClick={onDownload} loading={exporting && !copying} disabled={exporting || !ready} className="w-full h-8 [&>span]:block" ariaLabel="Download image">
+          {`Export ${format.toUpperCase()}`}
         </ActionButton>
-        <ActionButton icon="copy" onClick={onCopy} disabled={exporting || !ready} className="w-full h-8 [&>span]:block" ariaLabel="Copy image as PNG">
+        <ActionButton icon="copy" onClick={onCopy} loading={copying} disabled={exporting || !ready} className="w-full h-8 [&>span]:block" ariaLabel="Copy image as PNG">
           Copy image (PNG)
         </ActionButton>
         <p className="flex items-center gap-[5px] text-[10px] text-ink-3"><Icon name="shield" size={13} />Rendered on your device. Nothing is uploaded.</p>

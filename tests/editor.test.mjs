@@ -128,21 +128,152 @@ async function pointsOf(page) {
   });
 }
 
+/** Markers deliberately show their path instead of a rectangular selection frame. */
+async function highlightBounds(page) {
+  await page.waitForTimeout(900);
+  return page.evaluate(async () => {
+    const { readDraft } = await import('/src/lib/document-store.ts');
+    const { annotationBounds } = await import('/src/lib/render.ts');
+    const marker = (await readDraft())?.annotations.find(annotation => annotation.type === 'highlight');
+    if (!marker) throw new Error('No highlighter mark was saved');
+    return annotationBounds(marker);
+  });
+}
+
+test('numbered steps keep a continuous sequence through editing, undo, duplication, and reload', async () => {
+  const page = await editor();
+  const layer = number => page.locator('[data-testid="layer-select"]').filter({ hasText: new RegExp(`^Step ${number}$`) });
+  const place = async (x, y) => { const point = await imagePoint(page, x, y); await page.mouse.click(point.x, point.y); };
+  const setNumber = async (label, value) => { await page.getByLabel(label, { exact: true }).fill(String(value)); await page.getByLabel(label, { exact: true }).press('Enter'); };
+  try {
+    await page.keyboard.press('n');
+    assert.equal(await page.getByLabel('Next step number', { exact: true }).inputValue(), '1');
+    await place(200, 200);
+    await place(350, 200);
+    assert.equal(await layer(1).count(), 1);
+    assert.equal(await layer(2).count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Step (N)', exact: true }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await page.getByLabel('Next step number', { exact: true }).inputValue(), '3');
+
+    await page.keyboard.press('Control+z');
+    assert.equal(await layer(2).count(), 0);
+    assert.equal(await page.getByLabel('Next step number', { exact: true }).inputValue(), '2');
+    await page.keyboard.press('Control+Shift+z');
+    assert.equal(await layer(2).count(), 1);
+    await setNumber('Next step number', 10);
+    await place(500, 200);
+    assert.equal(await layer(10).count(), 1);
+    assert.equal(await page.getByLabel('Next step number', { exact: true }).inputValue(), '11');
+
+    await layer(2).click();
+    await setNumber('Step number', 7);
+    assert.equal(await layer(7).count(), 1);
+    await setNumber('Step size', 72);
+    await page.getByRole('group', { name: 'Step style', exact: true }).getByRole('button', { name: 'Outline', exact: true }).click();
+    await page.getByLabel('Step badge color', { exact: true }).fill('#124bcc');
+    const before = await selection(page);
+    await drag(page, [350, 200], [420, 300]);
+    const moved = await selection(page);
+    assert.ok(moved.x - before.x > 60 && moved.y - before.y > 90, 'the selected step moves with its digit');
+    const corner = await page.locator('[data-handle="se"]').boundingBox();
+    await page.mouse.move(corner.x + corner.width / 2, corner.y + corner.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(corner.x + 70, corner.y + 25, { steps: 8 });
+    await page.mouse.up();
+    const resized = await selection(page);
+    assert.ok(resized.width > moved.width + 30, 'dragging a corner resizes the badge');
+    assert.ok(Math.abs(resized.width - resized.height) < 0.01, 'a resized step remains circular');
+
+    await page.keyboard.press('Control+d');
+    assert.equal(await layer(11).count(), 1, 'duplicating a step advances its number');
+    await page.keyboard.press('Control+z');
+    assert.equal(await layer(11).count(), 0);
+    await layer(7).click();
+    const row = layer(7).locator('..');
+    await row.getByRole('button', { name: 'Lock layer', exact: true }).click();
+    assert.equal(await page.getByLabel('Step size', { exact: true }).isDisabled(), true);
+    assert.equal(await page.getByRole('group', { name: 'Step style' }).getByRole('button', { name: 'Filled', exact: true }).isDisabled(), true);
+    await row.getByRole('button', { name: 'Unlock layer', exact: true }).click();
+    await row.getByRole('button', { name: 'Hide Step', exact: true }).click();
+    assert.equal(await row.getAttribute('data-hidden'), 'true');
+    await row.getByRole('button', { name: 'Show Step', exact: true }).click();
+
+    await page.waitForTimeout(900);
+    await page.reload();
+    await page.locator('[data-testid="editor-artboard"] canvas').waitFor();
+    await layer(7).click();
+    assert.equal(await page.getByRole('button', { name: 'Outline', exact: true }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await page.getByLabel('Step badge color', { exact: true }).inputValue(), '#124bcc');
+    assert.equal(await page.getByLabel('Next step number', { exact: true }).inputValue(), '11');
+    await page.keyboard.press('n');
+    await place(650, 200);
+    assert.equal(await layer(11).count(), 1);
+    await page.getByRole('button', { name: 'Reset', exact: true }).click();
+    await place(800, 200);
+    assert.equal(await layer(1).count(), 2, 'reset starts a new numbered sequence without changing older steps');
+  } finally { await page.close(); }
+});
+
+test('numbered steps export their badge, fit long labels, and keep legacy circular bounds', async () => {
+  const page = await editor();
+  try {
+    const result = await page.evaluate(async () => {
+      const { renderComposition, annotationBounds } = await import('/src/lib/render.ts');
+      const { DEFAULT_STYLE } = await import('/src/lib/editor-types.ts');
+      const { createExportBlob } = await import('/src/lib/export.ts');
+      const { nextStepNumber, stepTextColor } = await import('/src/lib/steps.ts');
+      const source = document.createElement('canvas'); source.width = 400; source.height = 160;
+      const sourceContext = source.getContext('2d'); sourceContext.fillStyle = '#d0d0d0'; sourceContext.fillRect(0, 0, 400, 160);
+      const image = new Image(); image.src = source.toDataURL(); await image.decode();
+      await document.fonts.ready;
+      const legacy = { id: 'old', type: 'number', x: 20, y: 40, width: 80, height: 40, color: '#124bcc', strokeWidth: 4, number: 2 };
+      const outlined = { ...legacy, id: 'outline', x: 130, y: 20, width: 80, height: 80, stepStyle: 'outline', number: 1234 };
+      const light = { ...legacy, id: 'light', x: 250, y: 20, width: 80, height: 80, color: '#ffff00', number: 8 };
+      const rendered = renderComposition(image, [legacy, outlined, light], DEFAULT_STYLE);
+      const blob = await createExportBlob(rendered, 'png');
+      const exported = await createImageBitmap(blob);
+      const output = document.createElement('canvas'); output.width = exported.width; output.height = exported.height;
+      const context = output.getContext('2d'); context.drawImage(exported, 0, 0); exported.close();
+      const pixel = (x, y) => [...context.getImageData(x, y, 1, 1).data];
+      const ink = context.getImageData(130, 20, 80, 80).data;
+      let labelPixels = 0;
+      for (let y = 20; y < 60; y++) for (let x = 10; x < 70; x++) {
+        const i = (y * 80 + x) * 4;
+        if (ink[i] < 80 && ink[i + 1] < 130 && ink[i + 2] > 150) labelPixels++;
+      }
+      return { bounds: annotationBounds(legacy), blue: pixel(80, 60), outline: pixel(145, 40), light: pixel(310, 60), labelPixels,
+        next: nextStepNumber([legacy, outlined]), requested: nextStepNumber([outlined], 1), whiteText: stepTextColor('rgb(255, 255, 255)'), darkText: stepTextColor('#124bcc') };
+    });
+    assert.deepEqual(result.bounds, { x: 20, y: 20, width: 80, height: 80 });
+    assert.deepEqual(result.blue, [18, 75, 204, 255]);
+    assert.deepEqual(result.outline, [255, 255, 255, 255]);
+    assert.deepEqual(result.light, [255, 255, 0, 255]);
+    assert.ok(result.labelPixels > 100, 'the exported outline contains all four fitted digits');
+    assert.equal(result.next, 1235);
+    assert.equal(result.requested, 1);
+    assert.equal(result.whiteText, '#171717');
+    assert.equal(result.darkText, '#ffffff');
+  } finally { await page.close(); }
+});
+
 test('the highlighter is a marker that follows the path, not a box', async () => {
   const page = await editor();
   try {
     await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
     // A swipe that drifts: the mark has to follow it, so the box it occupies is only
     // the bounds of the path and not a rectangle the hand happened to describe.
+    await page.keyboard.down('Alt');
     await drag(page, [180, 220], [620, 300]);
+    await page.keyboard.up('Alt');
     await frames(page);
-    const bounds = await selection(page);
+    const bounds = await highlightBounds(page);
     // The mark is fat, so the box carries half its width on every side.
     assert.ok(bounds.height > 80, `the marker is wider than the path, got ${bounds.height}`);
     assert.ok(bounds.width > 400, `the mark follows the full length, got ${bounds.width}`);
 
     // A second mark is a separate layer, not a merge.
     await page.getByRole('button', { name: 'Select (V)', exact: true }).click();
+    assert.equal(await page.getByTestId('selected-marker').count(), 1, 'selection follows the marker path');
     assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Highlight 1' }).count(), 1);
   } finally { await page.close(); }
 });
@@ -168,10 +299,12 @@ test('Shift straightens the highlighter segment to a row, a column or 45 degrees
     const columnPoints = await pointsOf(page);
     assert.ok(columnPoints.every(p => Math.abs(p.x - columnPoints[0].x) < 0.01), `a Shift swipe must be flat, got xs ${JSON.stringify(columnPoints.map(p => Math.round(p.x)))}`);
 
-    // Without Shift the same drag keeps the drift, which is what proves the lock did it.
+    // Alt bypasses automatic row snapping, so a free swipe keeps the hand angle.
     await page.keyboard.press('Control+z');
     await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+    await page.keyboard.down('Alt');
     await drag(page, [180, 300], [640, 380]);
+    await page.keyboard.up('Alt');
     await frames(page);
     const free = await pointsOf(page);
     assert.ok(new Set(free.map(p => Math.round(p.y))).size > 1, 'a free swipe keeps the hand angle');
@@ -192,16 +325,18 @@ test('the highlighter size control changes how thick the mark is drawn', async (
   const page = await editor();
   try {
     await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+    // Text mode detects the screenshot's row height; this test exercises manual size.
+    await page.getByRole('group', { name: 'Highlight mode', exact: true }).getByRole('button', { name: 'Freehand', exact: true }).click();
     await drag(page, [200, 260], [600, 300]);
     await frames(page);
-    const thin = await selection(page);
+    const thin = await highlightBounds(page);
     assert.equal(await page.getByLabel('Highlighter size').inputValue(), '16', 'a fresh mark is 16px');
 
     await page.getByLabel('Highlighter size').fill('48');
     await page.getByLabel('Highlighter size').press('Enter');
     await page.waitForTimeout(150);
     assert.equal(await page.getByLabel('Highlighter size').inputValue(), '48');
-    const thick = await selection(page);
+    const thick = await highlightBounds(page);
     // Half the mark's width sits outside the path on each side, so a 16px to 48px mark
     // adds 32px to the box in total.
     assert.ok(thick.height - thin.height > 25 && thick.height - thin.height < 40, `the mark must get fatter, went ${thin.height} to ${thick.height}`);
@@ -212,9 +347,11 @@ test('a highlight can be picked, moved and deleted like any other layer', async 
   const page = await editor();
   try {
     await page.getByRole('button', { name: 'Highlight (H)', exact: true }).click();
+    await page.keyboard.down('Alt');
     await drag(page, [200, 300], [520, 340]);
+    await page.keyboard.up('Alt');
     await frames(page);
-    const before = await selection(page);
+    const before = await highlightBounds(page);
 
     // Reached by clicking the mark itself, which only works because it is picked along
     // its body rather than anywhere in its bounding box.
@@ -225,7 +362,7 @@ test('a highlight can be picked, moved and deleted like any other layer', async 
 
     await drag(page, [360, 320], [440, 420]);
     await frames(page);
-    const moved = await selection(page);
+    const moved = await highlightBounds(page);
     assert.ok(Math.abs(moved.x - before.x) > 40, `the mark must move, went from ${before.x} to ${moved.x}`);
 
     await page.keyboard.press('Delete');
@@ -268,7 +405,7 @@ test('the middle handle on a line bows the arrow, and double-click straightens i
     const bowed = await probe(page, [chord, above, below]);
     assert.ok(distance(bowed[1], empty[1]) > INK, 'the bow follows the handle to the other side of the chord');
     assert.ok(distance(bowed[2], empty[2]) <= INK, 'the old side of the chord is bare again');
-    assert.ok(distance(bowed[0], straight[0]) <= INK, 'the chord itself stays clear of a shallow bow');
+    assert.ok(distance(bowed[0], empty[0]) <= INK, 'the chord itself stays clear of a shallow bow');
     assert.equal(await page.locator('[data-testid="layer-select"]').filter({ hasText: 'Curved line' }).count(), 1, 'a bowed line is named for it');
 
     // Carrying the handle to the far side carries the bow with it.
@@ -453,6 +590,7 @@ test('a drawn shape hands the canvas back to Select, and Shift or Alt shapes the
     const squared = await selection(page);
     assert.ok(Math.abs(squared.width - squared.height) < 1, `Shift draws a square, got ${squared.width} by ${squared.height}`);
 
+    await page.getByRole('button', { name: 'Rectangle (R)', exact: true }).click();
     const start = await imagePoint(page, 300, 640);
     const end = await imagePoint(page, 420, 700);
     await page.keyboard.down('Alt');
@@ -778,6 +916,45 @@ function draftImageSrc(page, key) {
     return draft?.imageSrc;
   }, key);
 }
+
+test('Studio auto-copy copies the captured pixels once and respects the disabled preference', async () => {
+  const page = await editor();
+  try {
+    await page.addInitScript(() => {
+      window.__copiedImages = [];
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        write: async items => {
+          const blob = await items[0].getType('image/png');
+          const bitmap = await createImageBitmap(blob);
+          const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
+          const context = canvas.getContext('2d'); context.drawImage(bitmap, 0, 0); bitmap.close();
+          window.__copiedImages.push({ width: canvas.width, height: canvas.height, pixel: [...context.getImageData(0, 0, 1, 1).data] });
+        },
+      } });
+    });
+    await page.evaluate(() => localStorage.setItem('imageshot:autoCopy', 'true'));
+    await page.goto(url);
+    await page.locator('[data-testid="editor-artboard"] canvas').waitFor();
+    await frames(page);
+    assert.equal(await page.evaluate(() => window.__copiedImages.length), 0, 'opening the sample does not copy');
+    const dataUrl = await solidPng(page, 640, 480, '64,132,214');
+    const capture = await seedCapture(page, { id: 'auto-copy-1', name: 'Auto copy', sourceUrl: 'https://example.test', createdAt: Date.now(), mode: 'visible', width: 640, height: 480, dataUrl });
+    await page.goto(`${url}/editor.html?capture=${capture.id}`);
+    await page.waitForFunction(() => window.__copiedImages.length === 1);
+    assert.deepEqual(await page.evaluate(() => window.__copiedImages[0]), { width: 640, height: 480, pixel: [64, 132, 214, 255] });
+    await page.keyboard.press('n');
+    const point = await imagePoint(page, 200, 200);
+    await page.mouse.click(point.x, point.y);
+    await frames(page);
+    assert.equal(await page.evaluate(() => window.__copiedImages.length), 1, 'editing does not trigger automatic copy again');
+
+    await page.evaluate(() => localStorage.setItem('imageshot:autoCopy', 'false'));
+    await page.goto(`${url}/editor.html?capture=${capture.id}`);
+    await imageDimensions(page).filter({ hasText: '640 × 480' }).waitFor();
+    await frames(page);
+    assert.equal(await page.evaluate(() => window.__copiedImages.length), 0, 'disabled auto-copy leaves the clipboard alone');
+  } finally { await page.close(); }
+});
 
 test('a capture opens at its own size, and reopening it keeps the work on it', async () => {
   const page = await editor();

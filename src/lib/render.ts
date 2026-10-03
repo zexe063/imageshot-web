@@ -1,6 +1,10 @@
 import type { Annotation, CompositionSize, CompositionStyle, Point } from './editor-types';
 import { DEFAULT_STYLE } from './editor-types';
 import { smoothStroke, traceStroke } from './stroke';
+import { stepBounds, stepNumber, stepTextColor } from './steps';
+import { textPreset, textStack, textTreatment } from './text-presets';
+export { TEXT_FAMILIES, textStack } from './text-presets';
+import { drawBlur, drawSpotlights } from './effects';
 
 /** Height of the fake browser chrome drawn above the screenshot. */
 export const FRAME_HEADER = 40;
@@ -123,23 +127,14 @@ export function arrowHeadSize(annotation: Annotation, length: number): number {
   return Math.min(size, Math.max(6, length * 0.5));
 }
 
-/** The two families the app ships, so the canvas never guesses a missing face. */
-export const TEXT_FAMILIES = ['Inter', 'Geist'] as const;
-export type TextFamily = (typeof TEXT_FAMILIES)[number];
-const TEXT_STACKS: Record<TextFamily, string> = {
-  Inter: '"Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-  Geist: '"Geist Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-};
 const TEXT_WEIGHTS = [400, 500, 600, 700] as const;
-
-export function textStack(family?: string) {
-  return TEXT_STACKS[(family as TextFamily) ?? 'Inter'] ?? TEXT_STACKS.Inter;
-}
 
 /** Every text metric in one place, so the preview, the editor and the export agree. */
 export function textMetrics(annotation: Annotation) {
   const size = styleNumber(annotation.fontSize, 28) || 28;
-  const weight = TEXT_WEIGHTS.includes(annotation.fontWeight as (typeof TEXT_WEIGHTS)[number]) ? annotation.fontWeight! : 600;
+  const preset = textPreset(annotation.textPreset);
+  const family = annotation.fontFamily ?? preset.family;
+  const weight = TEXT_WEIGHTS.includes(annotation.fontWeight as (typeof TEXT_WEIGHTS)[number]) ? annotation.fontWeight! : preset.weight;
   const lineHeight = styleNumber(annotation.lineHeight, 1.3) || 1.3;
   const letterSpacing = styleNumber(annotation.letterSpacing, 0);
   const align = annotation.align ?? 'left';
@@ -149,9 +144,10 @@ export function textMetrics(annotation: Annotation) {
     lineHeight,
     letterSpacing,
     align,
+    family,
     lines: (annotation.text || '').split('\n'),
     lineStep: size * lineHeight,
-    font: `${weight} ${size}px ${textStack(annotation.fontFamily)}`,
+    font: `${weight} ${size}px ${textStack(family)}`,
   };
 }
 
@@ -171,27 +167,109 @@ function measureLine(context: CanvasRenderingContext2D | null, line: string, let
   return Math.max(0, total - letterSpacing);
 }
 
-/** The box the text needs, used for both drawing and the selection frame. */
-export function textFrame(annotation: Annotation) {
-  const { size, lineHeight, lineStep, lines, letterSpacing, font } = textMetrics(annotation);
-  const context = textContext();
-  if (context) context.font = font;
-  let widest = 0;
-  for (const line of lines) widest = Math.max(widest, measureLine(context, line, letterSpacing));
-  return { width: Math.max(12, widest), height: Math.max(size * lineHeight, lines.length * lineStep) };
+/** Italic bearings, accents and leading j's can extend outside their advance box. */
+function lineOverhang(context: CanvasRenderingContext2D | null, line: string, letterSpacing: number) {
+  let left = 0, right = 0, top = 0, bottom = 0, cursor = 0;
+  if (!context || !line) return { horizontal: 0, top: 0, bottom: 0 };
+  for (const part of letterSpacing ? [...line] : [line]) {
+    const metrics = context.measureText(part);
+    left = Math.max(left, metrics.actualBoundingBoxLeft - cursor);
+    right = Math.max(right, cursor + metrics.actualBoundingBoxRight);
+    top = Math.max(top, metrics.actualBoundingBoxAscent);
+    bottom = Math.max(bottom, metrics.actualBoundingBoxDescent);
+    cursor += metrics.width + letterSpacing;
+  }
+  const advance = cursor - letterSpacing;
+  return { horizontal: Math.max(left, right - advance), top, bottom };
 }
 
-/** Fills one line, advancing by hand when the text carries letter spacing. */
-function fillLine(context: CanvasRenderingContext2D, line: string, x: number, y: number, letterSpacing: number) {
+/** Text advances and treatment padding are shared by the canvas and native caret. */
+export function textLayout(annotation: Annotation) {
+  const { size, lineHeight, lineStep, lines, letterSpacing, font } = textMetrics(annotation);
+  const context = textContext();
+  if (context) { context.font = font; context.fontKerning = letterSpacing ? 'none' : 'normal'; context.textBaseline = 'top'; context.textAlign = 'left'; }
+  let widest = 0;
+  let overhangX = 0, overhangY = 0;
+  for (const line of lines) {
+    widest = Math.max(widest, measureLine(context, line, letterSpacing));
+    const ink = lineOverhang(context, line, letterSpacing);
+    overhangX = Math.max(overhangX, ink.horizontal);
+    overhangY = Math.max(overhangY, ink.top, ink.bottom - lineStep);
+  }
+  const treatment = textTreatment(annotation);
+  const paddingX = treatment.paddingX + overhangX;
+  const paddingY = treatment.paddingY + overhangY;
+  const contentWidth = Math.max(12, widest);
+  const contentHeight = Math.max(size * lineHeight, lines.length * lineStep);
+  return {
+    ...treatment,
+    paddingX,
+    paddingY,
+    contentWidth,
+    contentHeight,
+    width: contentWidth + paddingX * 2,
+    height: contentHeight + paddingY * 2,
+  };
+}
+
+/** The complete painted frame, including a text preset's background or outline. */
+export function textFrame(annotation: Annotation) {
+  const { width, height } = textLayout(annotation);
+  return { width, height };
+}
+
+/** Paints one line, advancing by hand when the text carries letter spacing. */
+function paintLine(context: CanvasRenderingContext2D, line: string, x: number, y: number, letterSpacing: number, outline = false) {
+  const paint = (text: string, left: number) => outline ? context.strokeText(text, left, y) : context.fillText(text, left, y);
   if (!letterSpacing) {
-    context.fillText(line, x, y);
+    paint(line, x);
     return;
   }
   let cursor = x;
   for (const character of line) {
-    context.fillText(character, cursor, y);
+    paint(character, cursor);
     cursor += context.measureText(character).width + letterSpacing;
   }
+}
+
+/** The exact same painter is used for the inline editor, canvas preview and export. */
+export function drawTextAnnotation(ctx: CanvasRenderingContext2D, annotation: Annotation) {
+  const { lineStep, lines, letterSpacing, align, font } = textMetrics(annotation);
+  const frame = textLayout(annotation);
+  ctx.save();
+  ctx.globalAlpha = clamp(styleNumber(annotation.opacity, 100), 0, 100) / 100;
+  ctx.font = font;
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.lineJoin = 'round';
+  if ('fontKerning' in ctx) ctx.fontKerning = letterSpacing ? 'none' : 'normal';
+  if (frame.background) {
+    roundedPath(ctx, annotation.x, annotation.y, frame.width, frame.height, frame.radius);
+    ctx.fillStyle = frame.background;
+    ctx.fill();
+    if (frame.borderWidth) {
+      // Keep the border inside the frame rather than clipping it at image edges.
+      const inset = frame.borderWidth / 2;
+      roundedPath(ctx, annotation.x + inset, annotation.y + inset, frame.width - inset * 2, frame.height - inset * 2, frame.radius);
+      ctx.strokeStyle = frame.borderColor;
+      ctx.lineWidth = frame.borderWidth;
+      ctx.stroke();
+    }
+  }
+  const context = textContext();
+  if (context) { context.font = font; context.fontKerning = letterSpacing ? 'none' : 'normal'; }
+  ctx.fillStyle = annotation.color;
+  ctx.strokeStyle = frame.outline;
+  ctx.lineWidth = frame.outlineWidth;
+  const positions = lines.map((line, index) => {
+    const width = measureLine(context, line, letterSpacing);
+    const offset = align === 'center' ? (frame.contentWidth - width) / 2 : align === 'right' ? frame.contentWidth - width : 0;
+    return { line, x: annotation.x + frame.paddingX + offset, y: annotation.y + frame.paddingY + index * lineStep };
+  });
+  // Outline every glyph first, so a following character never paints over prior ink.
+  if (frame.outlineWidth) for (const { line, x, y } of positions) paintLine(ctx, line, x, y, letterSpacing, true);
+  for (const { line, x, y } of positions) paintLine(ctx, line, x, y, letterSpacing);
+  ctx.restore();
 }
 
 export function getCompositionSize(image: HTMLImageElement, style: CompositionStyle = DEFAULT_STYLE): CompositionSize {
@@ -245,6 +323,7 @@ export function strokePath(annotation: Annotation): Point[] {
 }
 
 export function annotationBounds(annotation: Annotation) {
+  if (annotation.type === 'number') return stepBounds(annotation);
   if (annotation.type === 'text') {
     // The box always hugs the text. Dragging a text layer scales the type instead of
     // stretching a frame, so there is no stored width to honour here.
@@ -379,20 +458,7 @@ export function drawAnnotation(ctx: CanvasRenderingContext2D, annotation: Annota
       break;
     }
     case 'text': {
-      const { size, lineStep, lines, letterSpacing, align, font } = textMetrics(a);
-      ctx.font = font;
-      ctx.textBaseline = 'top';
-      // Alignment is resolved to a left edge here, so spaced and unspaced text are
-      // positioned by exactly the same maths.
-      ctx.textAlign = 'left';
-      const context = textContext();
-      if (context) context.font = font;
-      const frameWidth = textFrame(a).width;
-      lines.forEach((line, index) => {
-        const width = measureLine(context, line, letterSpacing);
-        const left = align === 'center' ? a.x + (frameWidth - width) / 2 : align === 'right' ? a.x + frameWidth - width : a.x;
-        fillLine(ctx, line, left, a.y + index * lineStep, letterSpacing);
-      });
+      drawTextAnnotation(ctx, a);
       break;
     }
     case 'highlight': {
@@ -419,40 +485,41 @@ export function drawAnnotation(ctx: CanvasRenderingContext2D, annotation: Annota
       break;
     }
     case 'blur': {
-      ctx.shadowColor = 'transparent';
-      ctx.shadowBlur = 0;
-      const sourceWidth = source.naturalWidth || source.width;
-      const sourceHeight = source.naturalHeight || source.height;
-      const x = Math.max(0, box.x);
-      const y = Math.max(0, box.y);
-      const w = Math.min(sourceWidth - x, box.width - Math.max(0, -box.x));
-      const h = Math.min(sourceHeight - y, box.height - Math.max(0, -box.y));
-      if (w <= 0 || h <= 0) break;
-      const pixelSize = Math.max(10, a.strokeWidth * 4);
-      const buffer = document.createElement('canvas');
-      buffer.width = Math.max(1, Math.ceil(w / pixelSize));
-      buffer.height = Math.max(1, Math.ceil(h / pixelSize));
-      const bufferCtx = buffer.getContext('2d');
-      if (!bufferCtx) break;
-      bufferCtx.drawImage(source, x, y, w, h, 0, 0, buffer.width, buffer.height);
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(buffer, 0, 0, buffer.width, buffer.height, x, y, w, h);
+      drawBlur(ctx, a, source);
       break;
     }
+    case 'spotlight':
+      // Composition rendering combines all visible openings into one shade.
+      drawSpotlights(ctx, [{ ...a, opacity: 100 }], source.naturalWidth || source.width, source.naturalHeight || source.height);
+      break;
     case 'number': {
       ctx.shadowColor = 'transparent';
-      const radius = Math.max(box.width, box.height) / 2;
+      const radius = box.width / 2;
+      const outlined = a.stepStyle === 'outline';
+      const border = Math.min(radius / 3, Math.max(1.5, box.width * 0.055));
+      const centerX = box.x + radius, centerY = box.y + radius;
       ctx.beginPath();
-      ctx.arc(box.x + box.width / 2, box.y + box.height / 2, radius, 0, Math.PI * 2);
+      ctx.arc(centerX, centerY, Math.max(0.1, radius - border / 2), 0, Math.PI * 2);
+      ctx.fillStyle = outlined ? '#ffffff' : a.color;
       ctx.fill();
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = outlined ? a.color : '#ffffff';
+      ctx.lineWidth = border;
       ctx.stroke();
-      ctx.fillStyle = '#ffffff';
-      ctx.font = `700 ${Math.round(radius * 0.95)}px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+      const contrast = stepTextColor(a.color);
+      ctx.fillStyle = outlined ? contrast === '#171717' ? '#171717' : a.color : contrast;
+      const label = String(stepNumber(a.number));
+      let fontSize = radius * 1.05;
+      const font = (size: number) => `700 ${size}px ${textStack('Inter')}`;
+      ctx.font = font(fontSize);
+      const measuredWidth = ctx.measureText(label).width;
+      if (measuredWidth > box.width * 0.68) fontSize *= box.width * 0.68 / measuredWidth;
+      ctx.font = font(fontSize);
       ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(String(a.number || 1), box.x + box.width / 2, box.y + box.height / 2 + 1);
+      ctx.textBaseline = 'alphabetic';
+      const metrics = ctx.measureText(label);
+      const ascent = metrics.actualBoundingBoxAscent || fontSize * 0.72;
+      const descent = metrics.actualBoundingBoxDescent || 0;
+      ctx.fillText(label, centerX, centerY + (ascent - descent) / 2);
       break;
     }
   }
@@ -614,7 +681,8 @@ export function renderComposition(image: HTMLImageElement, annotations: Annotati
   roundedPath(ctx, size.imageX, size.imageY, size.imageWidth, size.imageHeight, radius);
   ctx.clip();
   ctx.translate(size.imageX, size.imageY);
-  for (const annotation of annotations) drawAnnotation(ctx, annotation, image);
+  for (const annotation of annotations) if (annotation.type !== 'spotlight') drawAnnotation(ctx, annotation, image);
+  drawSpotlights(ctx, annotations, size.imageWidth, size.imageHeight);
   ctx.restore();
 
   if (stroke > 0 && style.strokeColor && style.strokeColor !== 'transparent') {

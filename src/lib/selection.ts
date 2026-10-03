@@ -18,6 +18,12 @@ export function transformAnnotation(annotation: Annotation, from: Box, to: Box):
   const sx = to.width / (from.width || 1);
   const sy = to.height / (from.height || 1);
   const map = (point: Point): Point => ({ x: to.x + (point.x - from.x) * sx, y: to.y + (point.y - from.y) * sy });
+  if (annotation.type === 'number') {
+    const box = annotationBounds(annotation);
+    const center = map({ x: box.x + box.width / 2, y: box.y + box.height / 2 });
+    const diameter = Math.max(3, box.width * Math.min(sx, sy));
+    return { ...annotation, x: center.x - diameter / 2, y: center.y - diameter / 2, width: diameter, height: diameter };
+  }
   if (annotation.type === 'text') {
     const next = { ...annotation, ...map(annotation), fontSize: Math.max(8, (annotation.fontSize || 28) * Math.max(sx, sy)) };
     return { ...next, ...textFrame(next) };

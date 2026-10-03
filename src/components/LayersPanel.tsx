@@ -111,7 +111,7 @@ export default function LayersPanel({
 
       {!annotations.length ? (
         <p className="px-3 pt-2.5 pb-3.5 text-app leading-[1.5] text-ink-3 border-t border-line-soft">Choose a shape tool, then drag on the image to add a layer.</p>
-      ) : <p className="px-3 py-2.5 text-[10px] leading-[1.5] text-ink-3 border-t border-line-soft">Shift click to select a range. Ctrl or ⌘ click to add or remove a layer.</p>}
+      ) : null}
     </aside>
   );
 }

@@ -1,82 +1,118 @@
-/**
- * All ImageShot preferences live in chrome.storage.local.
- * Every getter has a safe fallback so the extension works even on file:// or when storage is blocked.
- */
+﻿/** Shared preferences for extension pages, the worker, and the browser preview. */
 export type CaptureDestination = 'panel' | 'studio';
-
-const QUICK_COPY_KEY = 'imageshot:quickCopy';
-const THEME_KEY = 'imageshot:theme';
-const AUTO_COPY_KEY = 'imageshot:autoCopy';
-const FILE_FORMAT_KEY = 'imageshot:fileFormat';
-const SHOW_PANEL_KEY = 'imageshot:showPanel';
-const SHORTCUT_DISPLAY_KEY = 'imageshot:shortcut:display';
-const SHORTCUT_FULL_KEY = 'imageshot:shortcut:full';
-
-// --- capture destination ---
-export async function readCaptureDestination(): Promise<CaptureDestination> {
-  try {
-    const stored = await chrome.storage.local.get(QUICK_COPY_KEY);
-    return stored[QUICK_COPY_KEY] === false ? 'studio' : 'panel';
-  } catch { return 'panel'; }
-}
-export async function writeCaptureDestination(destination: CaptureDestination): Promise<void> {
-  try { await chrome.storage.local.set({ [QUICK_COPY_KEY]: destination === 'panel' }); } catch {}
-}
-
-// --- theme ---
 export type Theme = 'system' | 'light' | 'dark';
-export async function readTheme(): Promise<Theme> {
-  try {
-    const stored = await chrome.storage.local.get(THEME_KEY);
-    const v = stored[THEME_KEY];
-    return v === 'light' || v === 'dark' || v === 'system' ? v : 'system';
-  } catch { return 'system'; }
-}
-export async function writeTheme(theme: Theme): Promise<void> {
-  try { await chrome.storage.local.set({ [THEME_KEY]: theme }); } catch {}
-}
-
-// --- auto copy ---
-export async function readAutoCopy(): Promise<boolean> {
-  try {
-    const s = await chrome.storage.local.get(AUTO_COPY_KEY);
-    return s[AUTO_COPY_KEY] === true;
-  } catch { return false; }
-}
-export async function writeAutoCopy(enabled: boolean): Promise<void> {
-  try { await chrome.storage.local.set({ [AUTO_COPY_KEY]: enabled }); } catch {}
-}
-
-// --- show panel ---
-export async function readShowPanel(): Promise<boolean> {
-  try {
-    const s = await chrome.storage.local.get(SHOW_PANEL_KEY);
-    return s[SHOW_PANEL_KEY] === false ? false : true;
-  } catch { return true; }
-}
-export async function writeShowPanel(show: boolean): Promise<void> {
-  try { await chrome.storage.local.set({ [SHOW_PANEL_KEY]: show }); } catch {}
-}
-
-// --- file format ---
 export type FileFormat = 'png' | 'jpg';
-export async function readFileFormat(): Promise<FileFormat> {
-  try {
-    const s = await chrome.storage.local.get(FILE_FORMAT_KEY);
-    return s[FILE_FORMAT_KEY] === 'jpg' ? 'jpg' : 'png';
-  } catch { return 'png'; }
-}
-export async function writeFileFormat(format: FileFormat): Promise<void> {
-  try { await chrome.storage.local.set({ [FILE_FORMAT_KEY]: format }); } catch {}
+
+export const PREFERENCE_KEYS = {
+  captureDestination: 'imageshot:quickCopy',
+  theme: 'imageshot:theme',
+  autoCopy: 'imageshot:autoCopy',
+  freezeScreen: 'imageshot:freezeScreen',
+  fileFormat: 'imageshot:fileFormat',
+} as const;
+
+const localListeners = new Set<(keys: string[]) => void>();
+
+function extensionStorage() {
+  return typeof chrome !== 'undefined' ? chrome.storage?.local : undefined;
 }
 
-// --- shortcuts (labels the user edits in Settings; real Chrome bindings are in chrome://extensions) ---
-export async function readShortcuts(): Promise<{ display: string; full: string }> {
+function readLocal(key: string): unknown {
   try {
-    const s = await chrome.storage.local.get([SHORTCUT_DISPLAY_KEY, SHORTCUT_FULL_KEY]) as Record<string, string>;
-    return { display: s[SHORTCUT_DISPLAY_KEY] ?? 'Alt+Shift+A', full: s[SHORTCUT_FULL_KEY] ?? 'Alt+Shift+F' };
-  } catch { return { display: 'Alt+Shift+A', full: 'Alt+Shift+F' }; }
+    const raw = globalThis.localStorage?.getItem(key);
+    return raw === null || raw === undefined ? undefined : JSON.parse(raw);
+  } catch { return undefined; }
 }
-export async function writeShortcuts(shortcuts: { display: string; full: string }): Promise<void> {
-  try { await chrome.storage.local.set({ [SHORTCUT_DISPLAY_KEY]: shortcuts.display, [SHORTCUT_FULL_KEY]: shortcuts.full }); } catch {}
+
+async function read(key: string): Promise<unknown> {
+  const storage = extensionStorage();
+  if (storage) {
+    try { return (await storage.get(key))[key]; } catch { return readLocal(key); }
+  }
+  return readLocal(key);
+}
+
+async function write(key: string, value: unknown): Promise<void> {
+  const storage = extensionStorage();
+  if (storage) {
+    // A failed extension write must be reported, not presented as a saved setting.
+    await storage.set({ [key]: value });
+    try { globalThis.localStorage?.setItem(key, JSON.stringify(value)); } catch { /* Optional startup cache. */ }
+  } else {
+    if (!globalThis.localStorage) throw new Error('Settings storage is unavailable.');
+    globalThis.localStorage.setItem(key, JSON.stringify(value));
+  }
+  localListeners.forEach(listener => listener([key]));
+}
+
+/** Notify open views both across extension pages and within this document. */
+export function subscribePreferences(listener: (keys: string[]) => void): () => void {
+  localListeners.add(listener);
+  const onChromeChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+    if (area === 'local') listener(Object.keys(changes));
+  };
+  const onStorage = (event: StorageEvent) => {
+    // Extension pages use Chrome's authoritative event, not changes to its startup cache.
+    if (!extensionStorage()) listener(event.key ? [event.key] : Object.values(PREFERENCE_KEYS));
+  };
+  if (typeof chrome !== 'undefined') chrome.storage?.onChanged?.addListener(onChromeChange);
+  if (typeof window !== 'undefined') window.addEventListener('storage', onStorage);
+  return () => {
+    localListeners.delete(listener);
+    if (typeof chrome !== 'undefined') chrome.storage?.onChanged?.removeListener(onChromeChange);
+    if (typeof window !== 'undefined') window.removeEventListener('storage', onStorage);
+  };
+}
+
+export async function readCaptureDestination(): Promise<CaptureDestination> {
+  return await read(PREFERENCE_KEYS.captureDestination) === false ? 'studio' : 'panel';
+}
+export function writeCaptureDestination(destination: CaptureDestination): Promise<void> {
+  return write(PREFERENCE_KEYS.captureDestination, destination === 'panel');
+}
+export async function readTheme(): Promise<Theme> {
+  const value = await read(PREFERENCE_KEYS.theme);
+  return value === 'light' || value === 'dark' ? value : 'system';
+}
+export function readCachedTheme(): Theme {
+  const value = readLocal(PREFERENCE_KEYS.theme);
+  return value === 'light' || value === 'dark' ? value : 'system';
+}
+export function cacheTheme(theme: Theme): void {
+  try { globalThis.localStorage?.setItem(PREFERENCE_KEYS.theme, JSON.stringify(theme)); } catch { /* Startup cache is optional. */ }
+}
+export function writeTheme(theme: Theme): Promise<void> {
+  return write(PREFERENCE_KEYS.theme, theme);
+}
+export async function readAutoCopy(): Promise<boolean> {
+  return await read(PREFERENCE_KEYS.autoCopy) === true;
+}
+export function writeAutoCopy(enabled: boolean): Promise<void> {
+  return write(PREFERENCE_KEYS.autoCopy, enabled);
+}
+/** Keep the initial viewport frame still while selecting an area. */
+export async function readFreezeScreen(): Promise<boolean> {
+  return await read(PREFERENCE_KEYS.freezeScreen) === true;
+}
+export function writeFreezeScreen(enabled: boolean): Promise<void> {
+  return write(PREFERENCE_KEYS.freezeScreen, enabled);
+}
+export async function readFileFormat(): Promise<FileFormat> {
+  return await read(PREFERENCE_KEYS.fileFormat) === 'jpg' ? 'jpg' : 'png';
+}
+export function writeFileFormat(format: FileFormat): Promise<void> {
+  return write(PREFERENCE_KEYS.fileFormat, format);
+}
+
+/** Actual browser bindings; Chrome does not let extensions reassign these. */
+export async function readShortcuts(): Promise<{ area: string; display: string; full: string }> {
+  if (typeof chrome !== 'undefined' && chrome.commands?.getAll) {
+    const commands = await chrome.commands.getAll();
+    return {
+      area: commands.find(command => command.name === 'capture-area')?.shortcut || 'Not assigned',
+      display: commands.find(command => command.name === 'capture-display')?.shortcut || 'Not assigned',
+      full: commands.find(command => command.name === 'capture-full')?.shortcut || 'Not assigned',
+    };
+  }
+  return { area: 'Alt+Shift+R', display: 'Alt+Shift+A', full: 'Alt+Shift+F' };
 }

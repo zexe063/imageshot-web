@@ -1,8 +1,11 @@
 import { useState } from 'react';
 import { Icon } from './Icon';
 import { ColorField, IconButton, NumberField, PropertyField, Row, Section, Segmented, Select, WeightField } from './ui';
-import type { Annotation, ArrowDefaults, ArrowEnds, ArrowHead, CompositionStyle, Tool } from '../lib/editor-types';
+import type { Annotation, ArrowDefaults, ArrowEnds, ArrowHead, CompositionStyle, StepDefaults, StepStyle, Tool } from '../lib/editor-types';
 import { TEXT_FAMILIES, markerWidthFromWeight, textMetrics } from '../lib/render';
+import { stepNumber } from '../lib/steps';
+import { TEXT_PRESETS, textPresetPatch, textStack, textTreatment } from '../lib/text-presets';
+import { blurAmount, blurMode } from '../lib/effects';
 
 const FONT_SIZES = [10, 11, 12, 13, 14, 15, 16, 20, 24, 32, 36, 40, 48, 64, 96, 128];
 const FONT_WEIGHTS = [
@@ -20,7 +23,7 @@ const BACKGROUND_PRESETS = [
 ];
 
 const SHAPE_TYPES = ['rectangle', 'ellipse'];
-const LINE_TYPES = ['arrow', 'pen', 'number'];
+const LINE_TYPES = ['arrow', 'pen'];
 const ARROW_HEADS: { value: ArrowHead; label: string }[] = [
   { value: 'chevron', label: 'Open' },
   { value: 'triangle', label: 'Solid' },
@@ -32,7 +35,12 @@ const ARROW_ENDS: { value: ArrowEnds; label: string }[] = [
   { value: 'both', label: 'Both ends' },
 ];
 
-export interface ToolDefaults extends ArrowDefaults {
+export interface ToolDefaults extends ArrowDefaults, StepDefaults {
+  blurMode?: Annotation['blurMode'];
+  blurAmount?: Annotation['blurAmount'];
+  spotlightShape?: Annotation['spotlightShape'];
+  spotlightDim?: Annotation['spotlightDim'];
+  highlightMode?: Annotation['highlightMode'];
   color: string;
   strokeWidth: number;
   fontSize: number;
@@ -41,6 +49,9 @@ export interface ToolDefaults extends ArrowDefaults {
   lineHeight?: Annotation['lineHeight'];
   letterSpacing?: Annotation['letterSpacing'];
   align?: Annotation['align'];
+  textPreset?: Annotation['textPreset'];
+  textBackground?: Annotation['textBackground'];
+  textOutline?: Annotation['textOutline'];
   fill: string | null;
   radius: number;
   opacity: number;
@@ -56,12 +67,14 @@ interface PropertiesPanelProps {
   onStyle: (patch: Partial<CompositionStyle>) => void;
   onLayer: (patch: Partial<Annotation>) => void;
   onDefaults: (patch: Partial<ToolDefaults>) => void;
+  nextStepNumber: number;
+  onNextStepNumber: (value: number) => void;
   onDuplicate: () => void;
   onDelete: () => void;
 }
 
 export default function PropertiesPanel({
-  selected, selectedName, style, bounds, tool, defaults, onStyle, onLayer, onDefaults, onDuplicate, onDelete,
+  selected, selectedName, style, bounds, tool, defaults, onStyle, onLayer, onDefaults, nextStepNumber, onNextStepNumber, onDuplicate, onDelete,
 }: PropertiesPanelProps) {
   const [lockRatio, setLockRatio] = useState(false);
   const locked = !!selected?.locked;
@@ -73,6 +86,12 @@ export default function PropertiesPanel({
   const isLine = LINE_TYPES.includes(type);
   const isText = type === 'text';
   const isImage = !selected && !drawing;
+  const effect = selected ?? defaults;
+  const effectMode = selected ? blurMode(selected) : defaults.blurMode ?? 'pixelate';
+  const effectStrength = blurAmount({ ...effect, blurMode: effectMode });
+  const spotlightShape = effect.spotlightShape ?? 'rectangle';
+  const spotlightDim = effect.spotlightDim ?? 65;
+  const highlightMode = selected ? selected.highlightMode ?? (selected.points?.length ? 'freehand' : 'text') : defaults.highlightMode ?? 'text';
 
   // Layer values fall back to the tool defaults so the next shape starts styled.
   const color = selected?.color ?? defaults.color;
@@ -90,7 +109,8 @@ export default function PropertiesPanel({
   // Everything below mirrors the renderer's defaults, so a layer saved without the
   // new fields still shows the values it is actually drawn with.
   const textType = textMetrics({ id: 'panel', type: 'text', x: 0, y: 0, width: 0, height: 0, ...(selected ?? defaults), text: selected?.text ?? '' });
-  const fontFamily = (selected ? selected.fontFamily : defaults.fontFamily) ?? 'Inter';
+  const fontFamily = textType.family;
+  const textAppearance = textTreatment(selected ?? defaults);
   const fontWeight = textType.weight;
   const lineHeight = textType.lineHeight;
   const letterSpacing = textType.letterSpacing;
@@ -201,6 +221,33 @@ export default function PropertiesPanel({
           </>
         ) : null}
 
+        {type === 'number' ? (
+          <>
+            <Section title="Steps" id="step-numbering">
+              {selected ? <PropertyField label="Number"><NumberField value={stepNumber(selected.number)} min={1} max={999999} icon="number" ariaLabel="Step number" disabled={locked} onChange={value => send('number', stepNumber(value))} /></PropertyField> : null}
+              <PropertyField label="Next number">
+                <div className="flex items-center gap-1.5">
+                  <NumberField value={nextStepNumber} min={1} max={999999} icon="number" ariaLabel="Next step number" onChange={value => onNextStepNumber(stepNumber(value))} />
+                  <button type="button" className="h-7 px-2 rounded-control bg-field text-app text-ink-2 hover:bg-field-hover" title="Restart numbering at 1" onClick={() => onNextStepNumber(1)}>Reset</button>
+                </div>
+              </PropertyField>
+              <p className="text-[10px] leading-relaxed text-ink-3">Each click adds the next step. Press Esc to move existing steps.</p>
+            </Section>
+            <Section title="Appearance" id="step-appearance">
+              <Segmented label="Step style" value={(selected ? selected.stepStyle : defaults.stepStyle) ?? 'filled'} disabled={locked} options={[{ value: 'filled', label: 'Filled' }, { value: 'outline', label: 'Outline' }]} onChange={(value: StepStyle) => send('stepStyle', value)} />
+              <PropertyField label="Size">
+                <NumberField value={Math.round(selected && bounds ? bounds.width : defaults.stepSize)} min={16} max={240} suffix="px" icon="number" ariaLabel="Step size" disabled={locked} onChange={value => {
+                  const diameter = Math.round(value);
+                  if (selected && bounds) onLayer({ x: bounds.x + (bounds.width - diameter) / 2, y: bounds.y + (bounds.height - diameter) / 2, width: diameter, height: diameter });
+                  else onDefaults({ stepSize: diameter });
+                }} />
+              </PropertyField>
+              <ColorField color={color} ariaLabel="Step color" nativeLabel="Step badge color" disabled={locked} onChange={value => send('color', value)} />
+              <PropertyField label="Opacity"><NumberField value={opacity} suffix="%" min={0} max={100} icon="transparent" ariaLabel="Step opacity" disabled={locked} onChange={value => send('opacity', Math.round(value))} /></PropertyField>
+            </Section>
+          </>
+        ) : null}
+
         {isShape || isLine ? (
           <>
             <Section title="Dimensions" id={`${type}-dimensions`}>
@@ -296,6 +343,43 @@ export default function PropertiesPanel({
         ) : null}
 
         {isText ? (
+          <Section title="Presets" id="text-presets">
+            <div className="grid grid-cols-2 gap-1.5" role="group" aria-label="Text styles">
+              {TEXT_PRESETS.map(preset => {
+                const treatment = textTreatment({ ...textPresetPatch(preset.id), fontSize: 17 });
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    aria-label={`${preset.label} text style`}
+                    aria-pressed={textAppearance.preset === preset.id}
+                    disabled={locked}
+                    className={`flex flex-col items-center justify-center gap-1 min-w-0 h-[57px] rounded-control border text-ink enabled:hover:bg-field-hover aria-pressed:border-accent aria-pressed:bg-accent-soft ${textAppearance.preset === preset.id ? 'border-accent' : 'border-line'} ${preset.id === 'monospaced-boxed' ? 'col-span-2' : ''}`}
+                    onPointerDown={event => event.preventDefault()}
+                    onClick={() => {
+                      const patch = textPresetPatch(preset.id);
+                      onDefaults(patch as Partial<ToolDefaults>);
+                      if (selected) onLayer(patch);
+                    }}
+                  >
+                    <span aria-hidden="true" style={{
+                      fontFamily: textStack(preset.family), fontSize: 17, fontWeight: preset.weight, lineHeight: '22px',
+                      color: '#27272a', background: treatment.background ?? 'transparent',
+                      padding: treatment.background ? '0 7px' : 0,
+                      borderRadius: Number.isFinite(treatment.radius) ? treatment.radius : 999,
+                      border: treatment.borderWidth ? '1px solid #d4d4d8' : undefined,
+                      WebkitTextStroke: treatment.outlineWidth ? `${treatment.outlineWidth}px white` : undefined,
+                      paintOrder: 'stroke fill',
+                    }}>Aa</span>
+                    <span className="text-[10px] leading-none text-ink-2">{preset.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </Section>
+        ) : null}
+
+        {isText ? (
           <Section title="Text" id="text">
             <Row>
               <PropertyField label="Font" className="col-span-2">
@@ -361,12 +445,28 @@ export default function PropertiesPanel({
                 />
               </PropertyField>
             </Row>
+            <Segmented label="Text alignment" value={textType.align} disabled={locked} options={[{ value: 'left', label: 'Left' }, { value: 'center', label: 'Center' }, { value: 'right', label: 'Right' }]} onChange={(value: NonNullable<Annotation['align']>) => sendType({ align: value })} />
+            {textAppearance.background ? (
+              <PropertyField label="Background">
+                <ColorField color={textAppearance.background} ariaLabel="Text background" nativeLabel="Text background color" disabled={locked} onChange={value => sendType({ textBackground: value })} />
+              </PropertyField>
+            ) : null}
+            {textAppearance.outlineWidth ? (
+              <PropertyField label="Outline">
+                <ColorField color={textAppearance.outline} ariaLabel="Text outline" nativeLabel="Text outline color" disabled={locked} onChange={value => sendType({ textOutline: value })} />
+              </PropertyField>
+            ) : null}
+            <PropertyField label="Opacity">
+              <NumberField value={opacity} suffix="%" min={0} max={100} ariaLabel="Text opacity" disabled={locked} onChange={value => sendType({ opacity: Math.round(value) })} />
+            </PropertyField>
           </Section>
         ) : null}
 
 
-                {type === 'highlight' ? (
+        {type === 'highlight' ? (
           <Section title="Highlighter" id="highlight-fill">
+            <Segmented label="Highlight mode" value={highlightMode} disabled={locked} options={[{ value: 'text', label: 'Text' }, { value: 'freehand', label: 'Freehand' }]} onChange={(value: 'text' | 'freehand') => send('highlightMode', value)} />
+            <p className="text-[11px] leading-relaxed text-ink-3">{highlightMode === 'text' ? 'Drag across text to match its height. Hold Alt to draw freely.' : 'Draw freely with the marker size below.'}</p>
             <ColorField
               color={color}
               ariaLabel="Highlight color"
@@ -395,11 +495,23 @@ export default function PropertiesPanel({
         ) : null}
 
         {type === 'blur' ? (
-          <Section title="Dimensions" id="blur-dimensions">
-            {sizeFields}
+          <Section title="Blur" id="blur-effect">
+            <Segmented label="Blur mode" value={effectMode} disabled={locked} options={[{ value: 'pixelate', label: 'Pixelate' }, { value: 'blur', label: 'Blur' }]} onChange={(value: 'blur' | 'pixelate') => send('blurMode', value)} />
+            {selected ? sizeFields : null}
             <PropertyField label="Strength">
-              <NumberField value={weight} min={1} max={60} icon="blur" disabled={locked} onChange={value => send('strokeWidth', Math.round(value))} />
+              <NumberField value={effectStrength} min={effectMode === 'blur' ? 1 : 2} max={effectMode === 'blur' ? 60 : 240} suffix="px" icon="blur" ariaLabel="Blur strength" disabled={locked} onChange={value => send('blurAmount', Math.round(value))} />
             </PropertyField>
+          </Section>
+        ) : null}
+
+        {type === 'spotlight' ? (
+          <Section title="Spotlight" id="spotlight-effect">
+            <Segmented label="Spotlight shape" value={spotlightShape} disabled={locked} options={[{ value: 'rectangle', label: 'Rectangle', icon: 'rectangle' }, { value: 'ellipse', label: 'Ellipse', icon: 'ellipse' }]} onChange={(value: 'rectangle' | 'ellipse') => send('spotlightShape', value)} />
+            {selected ? sizeFields : null}
+            <PropertyField label="Dim background">
+              <NumberField value={spotlightDim} min={0} max={100} suffix="%" icon="spotlight" ariaLabel="Spotlight dim" disabled={locked} onChange={value => send('spotlightDim', Math.round(value))} />
+            </PropertyField>
+            <p className="text-[11px] leading-relaxed text-ink-3">Keep the selected area clear and dim everything around it.</p>
           </Section>
         ) : null}
       </div>

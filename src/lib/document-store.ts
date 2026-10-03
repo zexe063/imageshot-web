@@ -7,6 +7,8 @@ export interface ShotDocument {
   style: CompositionStyle;
   sample: boolean;
   captureId?: string;
+  /** Next number in the active step sequence; stored with history and the draft. */
+  nextStepNumber?: number;
 }
 function openDrafts(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {

@@ -19,12 +19,18 @@ The development server runs the editor and popup preview. Webpage capture requir
 ## Capture
 
 1. Open the webpage to capture, then click ImageShot or press **Alt + Shift + S**.
-2. Choose **Visible page** for the current viewport, **Full page** for the whole document, or **Select area** and drag around a region. **Esc** cancels an area selection.
-3. The image opens in the editor. Keep the tab active and its size and display scale unchanged while a full-page capture runs, and finish the save from the editor afterwards.
+2. Choose **Display** for the current viewport, **Full page** for the whole document, or **Area** and drag around a region. **Esc** cancels an area selection or full-page capture.
+3. The image opens in the preview panel or editor, according to Settings. Keep the tab active and its size and display scale unchanged while a full-page capture runs. The extension icon shows capture progress.
+
+The default capture shortcuts are **Alt + Shift + R** for Area, **Alt + Shift + A** for Display, and **Alt + Shift + F** for Full page. Open **Settings → Shortcuts** to see your browser's current bindings and use **Edit** beside a capture mode to change its binding in the browser's shortcut settings.
+
+Full-page capture follows the document or a page's main inner scroll area, waits briefly for visible lazy images, and restores the original scroll position and sticky elements afterwards. Chromium permits about two screenshot frames per second, so longer pages still take longer. Pages that block scrolling or change layout during capture report a useful error instead of saving an incomplete image.
 
 Captures and editor drafts stay in local IndexedDB. The capture history retains the newest twelve screenshots. Capturing a page does not upload it.
 
 ## Annotating
+
+Choose **Step** (**N**) and click to place numbered circles: 1, 2, 3, and so on. The Step panel sets the next number, badge size, color, and filled or outlined style. Select an existing step to edit its number, move it, or resize it. Steps support undo/redo, saved drafts, and every export format.
 
 Choose **Line** (**A**) and drag to point at something. The **Arrow** panel switches the body between three shapes:
 
@@ -48,9 +54,15 @@ Choose **Original size** to size the page from the image at 96 pixels per inch; 
 
 Very long pages are reduced proportionally to the PDF reader's supported page dimensions while retaining all embedded pixels. **Copy image (PNG)** copies a raster image; use **Export PDF** to save the PDF file.
 
+## Settings
+
+Open **Settings** inside the capture popup, or choose **Settings** from the editor's file menu. Settings stay in the current view and closing them returns to your work. **Light**, **Dark**, and **System** apply immediately across open ImageShot views and remain saved for the next session. System follows changes to your device's appearance.
+
+Capture settings choose the preview panel or editor, automatic clipboard copy, and the default PNG/JPG download format. Clipboard copying always uses PNG; a browser that blocks automatic copying offers a manual Copy action. The preview downloads and editor export menu use your saved default format. The shortcuts page shows the browser's actual capture bindings and links to its shortcut settings.
+
 ## Supported bounds
 
-Browser settings and extension-store pages cannot be captured. A full-page capture is limited to 40 screenshot tiles and approximately 56 MB of source image data, and an area selection expires after two minutes.
+Browser settings and extension-store pages cannot be captured. A full-page capture is limited to 80 screenshot tiles and approximately 56 MB of source image data, and an area selection expires after two minutes.
 
 A page too tall for a single canvas is not refused. Chrome cannot hold a canvas past 32,767 pixels on a side, and past roughly 48 megapixels it runs the tab short of memory, so ImageShot composes a larger capture at a reduced scale (typically 70-90%) and says so when the image opens. The stored tiles keep their original resolution, so **Select area** still gives a full-resolution crop of any part of the page.
 

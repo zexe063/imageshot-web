@@ -9,6 +9,7 @@ import { chromium } from '@playwright/test'
 const backgroundSource = ts.transpileModule(await readFile(new URL('../src/extension/background.ts', import.meta.url), 'utf8'), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText.replace(/^import .*?;\r?\n/gm, '')
+const geistFontData = `data:font/woff2;base64,${(await readFile(new URL('../node_modules/@fontsource-variable/geist/files/geist-latin-wght-normal.woff2', import.meta.url))).toString('base64')}`
 const storeSource = ts.transpileModule(await readFile(new URL('../src/lib/capture-store.ts', import.meta.url), 'utf8'), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText.replace(/^export /gm, '')
@@ -31,7 +32,14 @@ async function harness(html, options = {}) {
   // extension gets for free, so the messages it sends are recorded here.
   await context.exposeFunction('__imageshotPanelMessage', (message) => { pageMessages.push(message) })
   await context.addInitScript(() => {
-    globalThis.chrome = { runtime: { id: 'imageshot-test', sendMessage: message => globalThis.__imageshotPanelMessage(message) } }
+    globalThis.__imageshotPreferenceListeners = new Set()
+    globalThis.chrome = {
+      runtime: { id: 'imageshot-test', sendMessage: message => globalThis.__imageshotPanelMessage(message) },
+      storage: { onChanged: {
+        addListener: listener => globalThis.__imageshotPreferenceListeners.add(listener),
+        removeListener: listener => globalThis.__imageshotPreferenceListeners.delete(listener),
+      } },
+    }
   })
   await context.route(`${origin}://capture.test/**`, (route) => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><head><title>Capture fixture</title></head><body>${html}</body></html>` }))
   const page = await context.newPage()
@@ -40,12 +48,18 @@ async function harness(html, options = {}) {
   const events = []
   const urls = []
   const captureTimes = []
+  const badgeUpdates = []
   const settings = { 'imageshot:quickCopy': options.destination !== 'studio' }
   const tab = { id: 1, windowId: 5, url: options.tabUrl ?? page.url(), title: 'Capture fixture', active: true }
   let listener
   let activeId = 1
   let editorTabId
   const chrome = {
+    action: {
+      setBadgeText: async ({ text }) => { badgeUpdates.push(text) },
+      setBadgeBackgroundColor: async () => {},
+      setTitle: async () => {},
+    },
     runtime: {
       id: 'imageshot-test',
       onMessage: { addListener: (callback) => { listener = callback } },
@@ -64,7 +78,10 @@ async function harness(html, options = {}) {
         captureTimes.push(Date.now())
         events.push('capture')
         if (options.failAtCapture === captureTimes.length) throw new Error('Simulated browser capture failure.')
+        if (options.rateLimitAtCapture === captureTimes.length) throw new Error('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND quota exceeded')
+        await options.beforeCapture?.(page, captureTimes.length)
         const png = await page.screenshot({ type: 'png' })
+        await options.afterCapture?.(page, captureTimes.length)
         if (options.switchAtCapture === captureTimes.length) activeId = 2
         return `data:image/png;base64,${png.toString('base64')}`
       },
@@ -84,8 +101,12 @@ async function harness(html, options = {}) {
     },
   }
   vm.runInNewContext(backgroundSource, {
-    chrome, crypto: webcrypto, atob, setTimeout, clearTimeout, URLSearchParams,
+    chrome, crypto: webcrypto, atob, setTimeout, clearTimeout, URLSearchParams, geistFontData,
     readCaptureDestination: async () => (settings['imageshot:quickCopy'] === false ? 'studio' : 'panel'),
+    readTheme: async () => options.theme ?? 'light',
+    readFileFormat: async () => options.fileFormat ?? 'png',
+    readAutoCopy: async () => options.autoCopy ?? false,
+    readFreezeScreen: async () => options.freezeScreen ?? false,
     saveCapture: async (record) => { records.push(record); events.push('store') },
   })
   const capture = (mode) => new Promise((resolve, reject) => {
@@ -107,7 +128,7 @@ async function harness(html, options = {}) {
     }, { captureRecord: record, coordinates: points })
   }
   return {
-    page, records, events, urls, pageMessages, settings, captureTimes, capture, sample,
+    page, records, events, urls, pageMessages, settings, captureTimes, badgeUpdates, capture, sample,
     /** Delivers a message the way a page-side caller would. */
     send: (message) => { listener(message, { id: 'imageshot-test' }, () => {}); return new Promise(done => setTimeout(done, 20)) },
     close: () => context.close(),
@@ -133,12 +154,22 @@ test('a finished capture stays on the page with copy and studio actions', async 
     assert.deepEqual(fixture.urls, [])
     const panel = fixture.page.locator('[data-imageshot-capture]')
     await panel.waitFor()
-    assert.match(await panel.locator('.size').textContent(), /720 × 500/)
+    assert.equal(await panel.locator('.size').count(), 0, 'the floating preview has no dimensions footer')
     assert.equal(await panel.locator('.shot canvas').count(), 1, 'the panel shows the screenshot it took')
 
     // A working copy needs a secure context, which this fixture has.
     const copy = panel.locator('button[data-copy]')
     assert.equal(await copy.isDisabled(), false)
+    await panel.hover()
+    const session = await fixture.page.context().newCDPSession(fixture.page)
+    await session.send('DOM.enable')
+    await session.send('CSS.enable')
+    await session.send('DOM.getDocument', { depth: -1, pierce: true })
+    const { result } = await session.send('Runtime.evaluate', { expression: 'document.querySelector("[data-imageshot-capture]").shadowRoot.querySelector("[data-copy]")' })
+    const { nodeId } = await session.send('DOM.requestNode', { objectId: result.objectId })
+    const { fonts } = await session.send('CSS.getPlatformFontsForNode', { nodeId })
+    assert.ok(fonts.some(font => font.isCustomFont && font.familyName.startsWith('Geist') && font.glyphCount > 0), 'the injected panel renders bundled Geist on a website without the editor stylesheet')
+    await session.detach()
     await copy.click()
     await fixture.page.locator('button[data-copy]').getByText('Copied', { exact: true }).waitFor()
     const copied = await fixture.page.evaluate(async () => {
@@ -159,6 +190,7 @@ test('the panel opens the studio only when asked, and closes itself afterwards',
 
     const panel = fixture.page.locator('[data-imageshot-capture]')
     await panel.waitFor()
+    await panel.hover()
     await panel.locator('button[data-studio]').click()
     await fixture.page.locator('[data-imageshot-capture]').waitFor({ state: 'detached' })
     assert.deepEqual(fixture.pageMessages, [{ type: 'IMAGESHOT_OPEN_STUDIO', id: record.id }])
@@ -182,6 +214,7 @@ test('the pin uses display pixels on a high-density screen and copies the origin
     })
     assert.equal(preview.width, Math.round(preview.displayWidth * preview.ratio))
     assert.equal(preview.height, Math.round(preview.displayHeight * preview.ratio))
+    await panel.hover()
     await panel.locator('button[data-copy]').click()
     await panel.locator('button[data-copy]').getByText('Copied', { exact: true }).waitFor()
     const copied = await fixture.page.evaluate(async () => {
@@ -206,6 +239,7 @@ test('copy works while the pinned preview is still decoding', async () => {
     const pending = fixture.capture('visible')
     const panel = fixture.page.locator('[data-imageshot-capture]')
     await panel.waitFor()
+    await panel.hover()
     await panel.locator('button[data-copy]').click()
     await panel.locator('button[data-copy]').getByText('Copied', { exact: true }).waitFor()
     assert.equal(await panel.locator('.working').count(), 1)
@@ -247,6 +281,7 @@ test('a full-page capture stitches the panel preview and copies the whole page',
     assert.equal(await panel.locator('.more').isVisible(), false, 'a whole page is not cropped')
 
     // Copying a full page has to rebuild it at full size, not hand over the preview.
+    await panel.hover()
     await panel.locator('button[data-copy]').click()
     await panel.locator('button[data-copy]').getByText('Copied', { exact: true }).waitFor()
     const copied = await fixture.page.evaluate(async () => {
@@ -266,18 +301,19 @@ test('the panel paints its actions so the copy button is actually visible', asyn
     await panel.waitFor()
     // A reset rule that out-specifies the fill leaves white text on a white pill, so
     // both sides of the pair are checked rather than trusting the stylesheet.
-    const painted = await panel.locator('[data-copy], [data-studio]').evaluateAll(buttons => buttons.map(button => {
+    const painted = await panel.locator('[data-copy], [data-studio]').evaluateAll(buttons => Object.fromEntries(buttons.map(button => {
       const style = getComputedStyle(button)
-      return { fill: style.backgroundColor, ink: style.color }
-    }))
-    assert.deepEqual(painted, [
-      { fill: 'rgb(98, 68, 224)', ink: 'rgb(255, 255, 255)' },
-      { fill: 'rgb(243, 241, 248)', ink: 'rgb(30, 30, 30)' },
-    ])
+      return [button.hasAttribute('data-copy') ? 'copy' : 'studio', { fill: style.backgroundColor, ink: style.color }]
+    })))
+    assert.deepEqual(painted, {
+      copy: { fill: 'rgb(98, 68, 224)', ink: 'rgb(255, 255, 255)' },
+      studio: { fill: 'rgb(241, 240, 246)', ink: 'rgb(32, 33, 42)' },
+    })
+
   } finally { await fixture.close() }
 })
 
-test('a page far taller than it is wide shows its top instead of a sliver', async () => {
+test('a tall page preview shows the complete screenshot at its original aspect ratio', async () => {
   const fixture = await harness('<p>very long</p>', { secure: true, viewport: { width: 720, height: 2000 } })
   try {
     const response = await fixture.capture('visible')
@@ -289,11 +325,11 @@ test('a page far taller than it is wide shows its top instead of a sliver', asyn
     await panel.waitFor()
     const frame = await panel.locator('.shot').boundingBox()
     const picture = await panel.locator('.picture').boundingBox()
-    // Letterboxing a 1:3 page into a fixed frame leaves a strip too narrow to read, so
-    // the preview fills the width instead and admits it is only the top.
-    assert.ok(picture.width / frame.width > 0.85, `the preview should fill the frame width, got ${Math.round(picture.width)} of ${Math.round(frame.width)}`)
-    assert.equal(await panel.locator('.more').isVisible(), true)
-    assert.match(await panel.locator('.more').textContent(), /Top of a long page/)
+    const canvas = await panel.locator('.picture canvas').boundingBox()
+    assert.ok(canvas.width <= picture.width && canvas.height <= frame.height)
+    assert.ok(Math.abs(canvas.height / canvas.width - record.height / record.width) < .08)
+    assert.equal(await panel.locator('.more').isVisible(), false)
+
   } finally { await fixture.close() }
 })
 
@@ -318,6 +354,7 @@ test('the panel closes on its own button and on Escape, and a new capture replac
     await panel.waitFor()
     assert.equal(await fixture.page.locator('[data-imageshot-capture]').count(), 1)
 
+    await panel.hover()
     await panel.locator('button.close').click()
     await fixture.page.locator('[data-imageshot-capture]').waitFor({ state: 'detached' })
 
@@ -335,13 +372,19 @@ test('the panel closes on its own button and on Escape, and a new capture replac
 })
 
 test('a failed capture leaves no panel behind', async () => {
-  const fixture = await harness('<p>fails</p>', { failAtCapture: 1 })
+  const fixture = await harness('<p>fails</p>', { failAtCapture: 1, theme: 'dark' })
   try {
     const response = await fixture.capture('visible')
     assert.equal(response.ok, false)
     assert.equal(fixture.records.length, 0)
     assert.equal(await fixture.page.locator('[data-imageshot-capture]').count(), 0)
     assert.equal(await fixture.page.locator('[data-imageshot-notice]').count(), 1)
+    const notice = fixture.page.locator('[data-imageshot-notice]')
+    assert.equal(await notice.getAttribute('data-theme'), 'dark')
+    const box = await notice.boundingBox()
+    const screenshot = await fixture.page.screenshot({ type: 'png' })
+    const visual = await fixture.sample({ id: 'error-theme', dataUrl: `data:image/png;base64,${screenshot.toString('base64')}` }, [[Math.round(box.x + box.width / 2), Math.round(box.y + box.height - 6)]])
+    assert.deepEqual(visual.pixels, [[36, 36, 44, 255]])
     assert.deepEqual(fixture.urls, [])
   } finally { await fixture.close() }
 })
@@ -502,7 +545,7 @@ test('full-page capture stitches the partial bottom tile and restores scrolling 
     assert.deepEqual([record.width, record.height], [720, 2140])
     assert.equal(record.tiles.length, 5)
     const decodedTiles = await fixture.page.evaluate(() => window.__panelDecodes)
-    assert.ok(decodedTiles > 0 && decodedTiles < record.tiles.length, 'the pin only decodes tiles visible in its top preview')
+    assert.equal(decodedTiles, record.tiles.length, 'the complete preview includes every captured section')
     assert.equal(record.tiles.at(-1).sourceY, 360)
     assert.equal(record.tiles.at(-1).height, 140)
     const image = await fixture.sample(record, [[50, 10], [50, 510], [50, 1010], [50, 1510], [50, 2130]])
@@ -515,7 +558,7 @@ test('full-page capture stitches the partial bottom tile and restores scrolling 
       fixedVisibility: document.querySelector('.fixed').style.visibility,
       temporaryState: !!window.__imageshotCaptureState,
     })), { y: 330, stickyPosition: 'sticky', stickyTop: '13px', stickyPriority: 'important', fixedVisibility: 'visible', temporaryState: false })
-    for (let i = 1; i < fixture.captureTimes.length; i += 1) assert.ok(fixture.captureTimes[i] - fixture.captureTimes[i - 1] >= 580, 'Capture calls must stay below Chromium rate limit')
+    for (let i = 1; i < fixture.captureTimes.length; i += 1) assert.ok(fixture.captureTimes[i] - fixture.captureTimes[i - 1] >= 500, 'Capture calls must stay below Chromium rate limit')
   } finally { await fixture.close() }
 })
 
@@ -532,11 +575,278 @@ test('full-page capture includes horizontal overflow without overlapping edge ti
   } finally { await fixture.close() }
 })
 
-test('area selection captures only the dragged rectangle after removing the overlay', async () => {
-  const fixture = await harness('<style>body{margin:0;background:rgb(75,155,210)}</style>')
+test('full-page capture follows the main app scroller, crops its frame, and restores independent scroll positions', async () => {
+  const fixture = await harness(`<style>
+    html,body{margin:0;height:100%;overflow:hidden}
+    .shell{position:fixed;inset:0;background:rgb(20,20,20)}
+    .sidebar{position:absolute;top:60px;bottom:0;width:140px;overflow:auto}
+    .sidebar div{height:1100px;background:rgb(240,40,40)}
+    .main{position:absolute;top:60px;left:150px;right:0;bottom:0;overflow:auto}
+    .sticky{position:sticky;top:0;height:40px;background:rgb(40,170,100)}
+    .band{height:500px}.one{background:rgb(70,130,230)}.two{background:rgb(130,80,210)}.three{background:rgb(245,190,70)}
+  </style><div class="shell"><div class="sidebar"><div></div></div><main class="main"><div class="sticky"></div><div class="band one"></div><div class="band two"></div><div class="band three"></div></main></div>`)
   try {
+    await fixture.page.evaluate(() => {
+      document.querySelector('.main').scrollTop = 123
+      document.querySelector('.sidebar').scrollTop = 87
+    })
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, true, response.error)
+    const record = fixture.records[0]
+    assert.deepEqual([record.width, record.height, record.tiles.length], [570, 1540, 4])
+    assert.deepEqual([record.tiles[0].sourceX, record.tiles[0].sourceY], [150, 60])
+    const image = await fixture.sample(record, [[10, 10], [10, 439], [10, 440], [10, 541], [10, 1041], [560, 1539]])
+    assert.deepEqual(image.pixels, [[40, 170, 100, 255], [70, 130, 230, 255], [70, 130, 230, 255], [130, 80, 210, 255], [245, 190, 70, 255], [245, 190, 70, 255]])
+    assert.deepEqual(await fixture.page.evaluate(() => [
+      document.querySelector('.main').scrollTop,
+      document.querySelector('.sidebar').scrollTop,
+      getComputedStyle(document.querySelector('.sticky')).position,
+      getComputedStyle(document.querySelector('.shell')).visibility,
+      !!window.__imageshotCaptureState,
+    ]), [123, 87, 'sticky', 'visible', false])
+    assert.equal(fixture.badgeUpdates[0], '0%')
+    assert.equal(fixture.badgeUpdates.at(-2), '99%')
+    assert.equal(fixture.badgeUpdates.at(-1), '')
+  } finally { await fixture.close() }
+})
+
+test('full-page capture disables scroll snapping and restores it after stitching every section', async () => {
+  const fixture = await harness(`<style>html{scroll-snap-type:y mandatory}body{margin:0}.band{height:320px;scroll-snap-align:start}.a{background:rgb(230,90,90)}.b{background:rgb(60,170,140)}</style><div class="band a"></div><div class="band b"></div><div class="band a"></div><div class="band b"></div><div class="band a"></div>`)
+  try {
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, true, response.error)
+    const record = fixture.records[0]
+    assert.deepEqual([record.width, record.height, record.tiles.length], [720, 1600, 4])
+    assert.deepEqual((await fixture.sample(record, [[10, 499], [10, 500], [10, 999], [10, 1000], [10, 1599]])).pixels,
+      [[60, 170, 140, 255], [60, 170, 140, 255], [60, 170, 140, 255], [60, 170, 140, 255], [230, 90, 90, 255]])
+    assert.equal(await fixture.page.evaluate(() => getComputedStyle(document.documentElement).scrollSnapType), 'y mandatory')
+  } finally { await fixture.close() }
+})
+
+test('content appended while the last screenshot encodes is included without a gap', async () => {
+  const fixture = await harness('<style>body{margin:0}.band{height:730px;background:rgb(70,130,230)}</style><div class="band"></div>', {
+    afterCapture: async (page, count) => {
+      if (count === 2) await page.evaluate(() => {
+        const more = document.createElement('div')
+        more.style.cssText = 'height:640px;background:rgb(245,190,70)'
+        document.body.append(more)
+      })
+    },
+  })
+  try {
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, true, response.error)
+    const record = fixture.records[0]
+    assert.deepEqual([record.width, record.height], [720, 1370])
+    assert.deepEqual((await fixture.sample(record, [[10, 729], [10, 730], [10, 1229], [10, 1230], [10, 1369]])).pixels,
+      [[70, 130, 230, 255], [245, 190, 70, 255], [245, 190, 70, 255], [245, 190, 70, 255], [245, 190, 70, 255]])
+  } finally { await fixture.close() }
+})
+
+test('a page that refuses to scroll fails instead of saving missing sections', async () => {
+  const fixture = await harness('<style>body{margin:0;height:1800px}</style><script>window.scrollTo = () => {}</script>', { destination: 'studio' })
+  try {
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, false)
+    assert.match(response.error, /prevented scrolling/)
+    assert.equal(fixture.records.length, 0)
+    assert.equal(fixture.captureTimes.length, 1)
+    assert.equal(fixture.badgeUpdates.at(-1), '')
+    assert.equal(await fixture.page.evaluate(() => !!window.__imageshotCaptureState), false)
+  } finally { await fixture.close() }
+})
+
+test('full-page capture excludes clipped horizontal overflow from its scroll extent', async () => {
+  // Landing-page carousels can extend the body's overflow box while the root
+  // clips it. That extra width cannot be reached by scrolling the document.
+  const fixture = await harness(`<style>
+    html,body{overflow-x:clip}body{margin:0;position:relative}.band{height:500px}
+    .one{background:rgb(70,130,230)}.two{background:rgb(60,170,140)}.three{background:rgb(245,190,70)}
+    .carousel{position:absolute;left:600px;top:100px;width:1500px;height:100px;background:rgb(130,80,210)}
+  </style><div class="band one"></div><div class="band two"></div><div class="band three"></div><div class="carousel"></div>`, { destination: 'studio' })
+  try {
+    assert.deepEqual(await fixture.page.evaluate(() => [document.documentElement.scrollWidth, document.body.scrollWidth]), [720, 2100])
+    await fixture.page.evaluate(() => window.scrollTo(0, 240))
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, true, response.error)
+    const record = fixture.records[0]
+    assert.deepEqual([record.width, record.height, record.tiles.length], [720, 1500, 3])
+    assert.deepEqual((await fixture.sample(record, [[599, 150], [719, 150], [10, 499], [10, 500], [10, 999], [10, 1000], [719, 1499]])).pixels,
+      [[70, 130, 230, 255], [130, 80, 210, 255], [70, 130, 230, 255], [60, 170, 140, 255], [60, 170, 140, 255], [245, 190, 70, 255], [245, 190, 70, 255]])
+    assert.deepEqual(await fixture.page.evaluate(() => [window.scrollX, window.scrollY, getComputedStyle(document.body).overflowX, !!window.__imageshotCaptureState]), [0, 240, 'clip', false])
+  } finally { await fixture.close() }
+})
+
+test('full-page capture uses the document scroll extent when a negative body margin makes the body taller', async () => {
+  const fixture = await harness(`<style>
+    body{margin:-100px 0 0}.band{height:500px}
+    .one{background:rgb(70,130,230)}.two{background:rgb(60,170,140)}.three{background:rgb(245,190,70)}
+  </style><div class="band one"></div><div class="band two"></div><div class="band three"></div>`, { destination: 'studio' })
+  try {
+    assert.deepEqual(await fixture.page.evaluate(() => [document.documentElement.scrollHeight, document.body.scrollHeight]), [1400, 1500])
+    await fixture.page.evaluate(() => window.scrollTo(0, 240))
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, true, response.error)
+    const record = fixture.records[0]
+    assert.deepEqual([record.width, record.height, record.tiles.length], [720, 1400, 3])
+    assert.deepEqual((await fixture.sample(record, [[10, 0], [10, 399], [10, 400], [10, 899], [10, 900], [10, 1399]])).pixels,
+      [[70, 130, 230, 255], [70, 130, 230, 255], [60, 170, 140, 255], [60, 170, 140, 255], [245, 190, 70, 255], [245, 190, 70, 255]])
+    assert.deepEqual(await fixture.page.evaluate(() => [window.scrollY, !!window.__imageshotCaptureState]), [240, false])
+  } finally { await fixture.close() }
+})
+
+test('Escape during the final frame cancels full-page capture and restores the page', async () => {
+  const fixture = await harness('<style>body{margin:0;height:950px;scroll-behavior:smooth}</style>', {
+    destination: 'studio',
+    afterCapture: async (page, count) => { if (count === 2) await page.keyboard.press('Escape') },
+  })
+  try {
+    await fixture.page.evaluate(() => window.scrollTo({ top: 220, behavior: 'instant' }))
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, false)
+    assert.equal(response.error, 'Capture cancelled.')
+    assert.equal(fixture.records.length, 0)
+    assert.deepEqual(await fixture.page.evaluate(() => [window.scrollY, !!window.__imageshotCaptureState]), [220, false])
+    assert.equal(fixture.badgeUpdates.at(-1), '')
+    assert.equal(await fixture.page.locator('[data-imageshot-notice]').count(), 0)
+  } finally { await fixture.close() }
+})
+
+test('a transient browser capture quota error retries the same frame once', async () => {
+  const fixture = await harness('<style>body{margin:0;height:830px;background:rgb(70,130,230)}</style>', { rateLimitAtCapture: 2, destination: 'studio' })
+  try {
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, true, response.error)
+    assert.equal(fixture.records[0].tiles.length, 2)
+    assert.equal(fixture.captureTimes.length, 3)
+    assert.deepEqual((await fixture.sample(fixture.records[0], [[10, 829]])).pixels, [[70, 130, 230, 255]])
+    assert.ok(fixture.captureTimes[2] - fixture.captureTimes[1] >= 500)
+  } finally { await fixture.close() }
+})
+
+test('a repeated visible capture excludes the previous pinned preview', async () => {
+  const fixture = await harness('<style>body{margin:0;background:rgb(70,130,230)}</style>')
+  try {
+    assert.equal((await fixture.capture('visible')).ok, true)
+    assert.equal((await fixture.capture('visible')).ok, true)
+    assert.deepEqual((await fixture.sample(fixture.records[1], [[650, 440]])).pixels, [[70, 130, 230, 255]])
+  } finally { await fixture.close() }
+})
+
+test('choosing the editor destination opens the saved screenshot in Studio', async () => {
+  const fixture = await harness('<p>Editor destination</p>', { destination: 'studio' })
+  try {
+    const response = await fixture.capture('visible')
+    assert.equal(response.ok, true, response.error)
+    assert.deepEqual(fixture.events, ['open-hidden', 'capture', 'store', 'focus'])
+    assert.equal(await fixture.page.locator('[data-imageshot-capture]').count(), 0)
+  } finally { await fixture.close() }
+})
+
+test('full-page capture waits for visible lazy images before taking their section', async () => {
+  const fixture = await harness(`<style>body{margin:0}.band{height:500px;background:rgb(70,130,230)}img{display:block;width:720px;height:500px}</style><div class="band"></div><img alt="Lazy image"><div class="band"></div>`)
+  try {
+    await fixture.page.route('**/lazy.svg', async route => {
+      await new Promise(resolve => setTimeout(resolve, 180))
+      await route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="720" height="500"><rect width="720" height="500" fill="rgb(60,170,140)"/></svg>' })
+    })
+    await fixture.page.evaluate(() => window.addEventListener('scroll', () => {
+      const image = document.querySelector('img')
+      if (window.scrollY >= 500 && !image.getAttribute('src')) image.src = '/lazy.svg'
+    }))
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, true, response.error)
+    assert.deepEqual((await fixture.sample(fixture.records[0], [[10, 499], [10, 500], [10, 999], [10, 1000]])).pixels,
+      [[70, 130, 230, 255], [60, 170, 140, 255], [60, 170, 140, 255], [70, 130, 230, 255]])
+  } finally { await fixture.close() }
+})
+
+test('resizing during the final frame fails cleanly without saving incomplete content', async () => {
+  const fixture = await harness('<style>body{margin:0;height:830px}</style>', {
+    destination: 'studio',
+    afterCapture: async (page, count) => { if (count === 2) await page.setViewportSize({ width: 800, height: 500 }) },
+  })
+  try {
+    const response = await fixture.capture('full')
+    assert.equal(response.ok, false)
+    assert.match(response.error, /changed its layout/)
+    assert.equal(fixture.records.length, 0)
+    assert.equal(fixture.events.at(-1), 'close')
+    assert.equal(await fixture.page.evaluate(() => !!window.__imageshotCaptureState), false)
+  } finally { await fixture.close() }
+})
+
+test('the preview follows saved and system themes and releases listeners when replaced', async () => {
+  const fixture = await harness('<p>Themed preview</p>', { theme: 'dark' })
+  try {
+    assert.equal((await fixture.capture('visible')).ok, true)
+    const panel = fixture.page.locator('[data-imageshot-capture]')
+    assert.equal(await panel.getAttribute('data-theme'), 'dark')
+    assert.equal(await panel.locator('.wrap').evaluate(element => getComputedStyle(element).backgroundColor), 'rgb(36, 36, 44)')
+    await fixture.page.evaluate(() => {
+      for (const listener of window.__imageshotPreferenceListeners) listener({ 'imageshot:theme': { newValue: 'light' } }, 'local')
+    })
+    assert.equal(await panel.getAttribute('data-theme'), 'light')
+    assert.equal(await panel.locator('.wrap').evaluate(element => getComputedStyle(element).backgroundColor), 'rgb(255, 255, 255)')
+    await fixture.page.emulateMedia({ colorScheme: 'dark' })
+    await fixture.page.evaluate(() => {
+      for (const listener of window.__imageshotPreferenceListeners) listener({ 'imageshot:theme': { newValue: 'system' } }, 'local')
+    })
+    assert.equal(await panel.getAttribute('data-theme'), 'dark')
+    assert.equal((await fixture.capture('visible')).ok, true)
+    assert.equal(await fixture.page.evaluate(() => window.__imageshotPreferenceListeners.size), 1)
+    await fixture.page.keyboard.press('Escape')
+    assert.equal(await fixture.page.evaluate(() => window.__imageshotPreferenceListeners.size), 0)
+  } finally { await fixture.close() }
+})
+
+test('the preview saves a real JPEG when JPEG is selected', async () => {
+  const fixture = await harness('<style>body{background:rgb(70,130,230)}</style>', { fileFormat: 'jpg' })
+  try {
+    assert.equal((await fixture.capture('visible')).ok, true)
+    const panel = fixture.page.locator('[data-imageshot-capture]')
+    await panel.hover()
+    const [download] = await Promise.all([
+      fixture.page.waitForEvent('download'),
+      panel.locator('[data-save-main]').click(),
+    ])
+    assert.match(download.suggestedFilename(), /\.jpg$/)
+    const bytes = await readFile(await download.path())
+    assert.deepEqual([...bytes.subarray(0, 3)], [255, 216, 255])
+  } finally { await fixture.close() }
+})
+
+test('automatic copy puts the original screenshot on the clipboard', async () => {
+  const fixture = await harness('<style>body{background:rgb(70,130,230)}</style>', { secure: true, autoCopy: true })
+  try {
+    assert.equal((await fixture.capture('visible')).ok, true)
+    await fixture.page.locator('[data-imageshot-capture] .note').getByText('Screenshot copied to your clipboard.', { exact: true }).waitFor()
+    const dimensions = await fixture.page.evaluate(async () => {
+      const bitmap = await createImageBitmap(await (await navigator.clipboard.read())[0].getType('image/png'))
+      return [bitmap.width, bitmap.height]
+    })
+    assert.deepEqual(dimensions, [720, 500])
+  } finally { await fixture.close() }
+})
+
+test('a blocked automatic copy leaves a working manual Copy action and clear feedback', async () => {
+  const fixture = await harness('<p>Clipboard blocked</p>', { secure: true, autoCopy: true })
+  try {
+    await fixture.page.evaluate(() => { navigator.clipboard.write = async () => { throw new Error('Not allowed') } })
+    assert.equal((await fixture.capture('visible')).ok, true)
+    const panel = fixture.page.locator('[data-imageshot-capture]')
+    await panel.locator('.note').getByText('Automatic copy was blocked. Click Copy, or open in Studio.', { exact: true }).waitFor()
+    assert.equal(await panel.locator('[data-copy]').isDisabled(), false)
+  } finally { await fixture.close() }
+})
+
+test('area selection captures only the dragged rectangle after removing the overlay', async () => {
+  const fixture = await harness('<style>body{margin:0;background:rgb(75,155,210)}</style>', { theme: 'system' })
+  try {
+    await fixture.page.emulateMedia({ colorScheme: 'dark' })
     const pending = fixture.capture('area')
     await fixture.page.locator('[data-imageshot-selector]').waitFor()
+    assert.deepEqual(await fixture.page.locator('[data-imageshot-selector]').evaluate(element => [element.dataset.theme, getComputedStyle(element).getPropertyValue('--panel').trim()]), ['dark', '#24242c'])
     await fixture.page.mouse.move(90, 120)
     await fixture.page.mouse.down()
     await fixture.page.mouse.move(430, 350)
@@ -565,6 +875,176 @@ test('Escape cancels area selection without saving or opening an editor', async 
     // The editor was opened early, so cancelling has to take it back down.
     assert.deepEqual(fixture.events, ['open-hidden', 'close'])
     assert.equal(await fixture.page.locator('[data-imageshot-selector]').count(), 0)
+  } finally { await fixture.close() }
+})
+
+test('Freeze screen shows and crops the original frame while the page changes at high density', async () => {
+  const fixture = await harness('<style>body{margin:0;background:rgb(75,155,210)}</style>', {
+    freezeScreen: true,
+    deviceScaleFactor: 2,
+    afterCapture: async page => page.evaluate(() => { document.body.style.background = 'rgb(210,95,75)' }),
+  })
+  try {
+    const pending = fixture.capture('area')
+    await fixture.page.locator('[data-imageshot-selector]').waitFor()
+    assert.equal(fixture.captureTimes.length, 1, 'the frame is taken before selection begins')
+    assert.equal(await fixture.page.evaluate(() => getComputedStyle(document.body).backgroundColor), 'rgb(210, 95, 75)')
+    // Reverse dragging exercises coordinates independently of the captured image.
+    await fixture.page.mouse.move(430, 350)
+    await fixture.page.mouse.down()
+    await fixture.page.mouse.move(90, 120)
+    const displayed = await fixture.page.screenshot({ type: 'png' })
+    assert.deepEqual((await fixture.sample({ width: 1440, height: 1000, dataUrl: `data:image/png;base64,${displayed.toString('base64')}` }, [[400, 400]])).pixels,
+      [[75, 155, 210, 255]], 'the selected region displays the frozen pixels while the page keeps changing behind it')
+    await fixture.page.mouse.up()
+    const response = await pending
+    assert.equal(response.ok, true, response.error)
+    assert.equal(fixture.captureTimes.length, 1, 'releasing the drag must not capture a later animation frame')
+    const record = fixture.records[0]
+    assert.deepEqual([record.width, record.height, record.tiles[0].sourceX, record.tiles[0].sourceY], [680, 460, 180, 240])
+    assert.deepEqual((await fixture.sample(record, [[1, 1], [678, 458]])).pixels, [[75, 155, 210, 255], [75, 155, 210, 255]])
+    assert.equal(await fixture.page.locator('[data-imageshot-selector]').count(), 0)
+    assert.equal(await fixture.page.evaluate(() => getComputedStyle(document.body).backgroundColor), 'rgb(210, 95, 75)')
+  } finally { await fixture.close() }
+})
+
+test('area capture with Freeze screen off still takes the current frame after selection', async () => {
+  const fixture = await harness('<style>body{margin:0;background:rgb(75,155,210)}</style>', { freezeScreen: false })
+  try {
+    const pending = fixture.capture('area')
+    await fixture.page.locator('[data-imageshot-selector]').waitFor()
+    assert.equal(fixture.captureTimes.length, 0)
+    await fixture.page.mouse.move(90, 120)
+    await fixture.page.mouse.down()
+    await fixture.page.mouse.move(430, 350)
+    await fixture.page.evaluate(() => { document.body.style.background = 'rgb(210,95,75)' })
+    await fixture.page.mouse.up()
+    const response = await pending
+    assert.equal(response.ok, true, response.error)
+    assert.equal(fixture.captureTimes.length, 1)
+    assert.deepEqual((await fixture.sample(fixture.records[0], [[1, 1], [338, 228]])).pixels, [[210, 95, 75, 255], [210, 95, 75, 255]])
+  } finally { await fixture.close() }
+})
+
+test('Escape releases a frozen screen without saving its frame and allows another capture', async () => {
+  const fixture = await harness('<style>body{margin:0;height:1800px;background:rgb(75,155,210)}</style>', { destination: 'studio', freezeScreen: true })
+  try {
+    const pending = fixture.capture('area')
+    await fixture.page.locator('[data-imageshot-selector]').waitFor()
+    await fixture.page.keyboard.press('Escape')
+    const response = await pending
+    assert.equal(response.ok, false)
+    assert.equal(response.error, 'Capture cancelled.')
+    assert.equal(fixture.records.length, 0)
+    assert.equal(fixture.captureTimes.length, 1)
+    assert.deepEqual(fixture.events, ['open-hidden', 'capture', 'close'])
+    assert.equal(await fixture.page.locator('[data-imageshot-selector]').count(), 0)
+    assert.equal(await fixture.page.locator('[data-imageshot-notice]').count(), 0)
+    assert.equal(await fixture.page.evaluate(() => window.dispatchEvent(new WheelEvent('wheel', { cancelable: true }))), true, 'scroll blocking is removed')
+    assert.equal((await fixture.capture('visible')).ok, true)
+    assert.equal(fixture.records.length, 1)
+  } finally { await fixture.close() }
+})
+
+test('Freeze screen rejects a window resized while its frame was being captured', async () => {
+  const fixture = await harness('<p>Resizing page</p>', {
+    destination: 'studio', freezeScreen: true,
+    afterCapture: async page => page.setViewportSize({ width: 800, height: 500 }),
+  })
+  try {
+    const response = await fixture.capture('area')
+    assert.equal(response.ok, false)
+    assert.match(response.error, /window size or zoom changed/)
+    assert.equal(fixture.records.length, 0)
+    assert.equal(fixture.captureTimes.length, 1)
+    assert.equal(fixture.events.at(-1), 'close')
+    assert.equal(await fixture.page.locator('[data-imageshot-selector]').count(), 0)
+  } finally { await fixture.close() }
+})
+
+test('resizing during frozen selection dismisses the overlay without saving stretched pixels', async () => {
+  const fixture = await harness('<p>Resizing selection</p>', { destination: 'studio', freezeScreen: true })
+  try {
+    const pending = fixture.capture('area')
+    await fixture.page.locator('[data-imageshot-selector]').waitFor()
+    await fixture.page.mouse.move(90, 120)
+    await fixture.page.mouse.down()
+    await fixture.page.mouse.move(430, 350)
+    await fixture.page.setViewportSize({ width: 800, height: 550 })
+    const response = await pending
+    assert.equal(response.ok, false)
+    assert.match(response.error, /window size or zoom changed/)
+    assert.equal(fixture.records.length, 0)
+    assert.equal(fixture.captureTimes.length, 1)
+    assert.equal(await fixture.page.locator('[data-imageshot-selector]').count(), 0)
+    assert.equal(await fixture.page.evaluate(() => window.dispatchEvent(new WheelEvent('wheel', { cancelable: true }))), true)
+  } finally { await fixture.close() }
+})
+
+test('a frozen selection timeout removes its frame and releases page input', async () => {
+  const fixture = await harness('<p>Timed out selection</p>', { destination: 'studio', freezeScreen: true })
+  try {
+    await fixture.page.evaluate(() => {
+      const originalSetTimeout = window.setTimeout.bind(window)
+      window.setTimeout = (callback, milliseconds, ...args) => {
+        if (milliseconds === 120_000) window.__expireSelection = callback
+        return originalSetTimeout(callback, milliseconds, ...args)
+      }
+    })
+    const pending = fixture.capture('area')
+    await fixture.page.locator('[data-imageshot-selector]').waitFor()
+    await fixture.page.evaluate(() => window.__expireSelection())
+    const response = await pending
+    assert.equal(response.ok, false)
+    assert.match(response.error, /selection timed out/)
+    assert.equal(fixture.records.length, 0)
+    assert.equal(fixture.events.at(-1), 'close')
+    assert.equal(await fixture.page.locator('[data-imageshot-selector]').count(), 0)
+    assert.equal(await fixture.page.evaluate(() => window.dispatchEvent(new WheelEvent('wheel', { cancelable: true }))), true)
+  } finally { await fixture.close() }
+})
+
+test('Freeze screen works when the website blocks image URLs with its content policy', async () => {
+  const fixture = await harness('<meta http-equiv="Content-Security-Policy" content="img-src \'none\'"><style>body{margin:0;background:rgb(75,155,210)}</style>', { destination: 'studio', freezeScreen: true })
+  try {
+    const pending = fixture.capture('area')
+    await fixture.page.locator('[data-imageshot-selector]').waitFor()
+    await fixture.page.mouse.move(90, 120)
+    await fixture.page.mouse.down()
+    await fixture.page.mouse.move(430, 350)
+    await fixture.page.mouse.up()
+    const response = await pending
+    assert.equal(response.ok, true, response.error)
+    assert.equal(fixture.captureTimes.length, 1)
+    assert.deepEqual([fixture.records[0].width, fixture.records[0].height], [340, 230])
+    assert.equal(await fixture.page.locator('[data-imageshot-selector]').count(), 0)
+  } finally { await fixture.close() }
+})
+
+test('cancelling while the frozen frame decodes releases the bitmap and never reopens selection', async () => {
+  const fixture = await harness('<p>Decoding a frozen frame</p>', { destination: 'studio', freezeScreen: true })
+  try {
+    await fixture.page.evaluate(() => {
+      const createBitmap = window.createImageBitmap.bind(window)
+      const gate = new Promise(resolve => { window.__releaseFreezeDecode = resolve })
+      window.createImageBitmap = async (...args) => {
+        const bitmap = await createBitmap(...args)
+        window.__pendingFreezeBitmap = bitmap
+        await gate
+        return bitmap
+      }
+    })
+    const pending = fixture.capture('area')
+    await fixture.page.waitForFunction(() => !!window.__pendingFreezeBitmap)
+    await fixture.page.keyboard.press('Escape')
+    const response = await pending
+    assert.equal(response.ok, false)
+    assert.equal(response.error, 'Capture cancelled.')
+    assert.equal(fixture.records.length, 0)
+    await fixture.page.evaluate(() => window.__releaseFreezeDecode())
+    await fixture.page.waitForFunction(() => window.__pendingFreezeBitmap.width === 0)
+    assert.equal(await fixture.page.locator('[data-imageshot-selector]').count(), 0)
+    assert.equal(await fixture.page.evaluate(() => window.dispatchEvent(new WheelEvent('wheel', { cancelable: true }))), true)
   } finally { await fixture.close() }
 })
 

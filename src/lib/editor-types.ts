@@ -6,10 +6,17 @@ export type Tool =
   | 'pen'
   | 'text'
   | 'blur'
+  | 'spotlight'
   | 'highlight'
   | 'crop'
-  /** Legacy: kept so older documents keep rendering. Not offered in the toolbar. */
   | 'number';
+
+export type StepStyle = 'filled' | 'outline';
+export type TextPreset = 'standard' | 'rounded' | 'monospaced' | 'outlined' | 'boxed' | 'rounded-boxed' | 'monospaced-boxed';
+export interface StepDefaults {
+  stepSize: number;
+  stepStyle: StepStyle;
+}
 
 /** How an arrow's body runs between its two ends. CleanShot-style: straight or curved. */
 export type ArrowStyle = 'straight' | 'curved';
@@ -57,6 +64,18 @@ export interface Annotation {
   /** Shape background colour. `null` keeps the shape outline only. */
   fill?: string | null;
   text?: string;
+  /** Preset treatment shared by text editing, preview, and export. */
+  textPreset?: TextPreset;
+  textBackground?: string;
+  textOutline?: string;
+  /** Missing mode preserves pixelation in older documents. */
+  blurMode?: 'blur' | 'pixelate';
+  /** Blur radius or pixel block size, in screenshot pixels. */
+  blurAmount?: number;
+  spotlightShape?: 'rectangle' | 'ellipse';
+  /** Percentage darkness outside the spotlight. */
+  spotlightDim?: number;
+  highlightMode?: 'text' | 'freehand';
   /** Typography, shared by the canvas preview, the inline editor and the export. */
   fontSize?: number;
   /** One of `TEXT_FAMILIES`, defaults to Inter. */
@@ -71,6 +90,8 @@ export interface Annotation {
   /** Pen points are local to the annotation's x/y. */
   points?: Point[];
   number?: number;
+  /** Numbered step badge treatment. Older saved steps use the filled treatment. */
+  stepStyle?: StepStyle;
   hidden?: boolean;
   locked?: boolean;
   /** 0-100, defaults to 100. */

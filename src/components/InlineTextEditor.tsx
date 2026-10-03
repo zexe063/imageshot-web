@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { Annotation } from '../lib/editor-types';
-import { textFrame, textMetrics, textStack } from '../lib/render';
+import { drawTextAnnotation, textLayout, textMetrics, textStack } from '../lib/render';
 
 interface InlineTextEditorProps {
   annotation: Annotation;
@@ -34,13 +34,14 @@ export default function InlineTextEditor({
   annotation, value, isNew, scale, imageX, imageY, onChange, onCommit, onCancel,
 }: InlineTextEditorProps) {
   const input = useRef<HTMLTextAreaElement>(null);
+  const preview = useRef<HTMLCanvasElement>(null);
   const composing = useRef(false);
   const blurredDuringComposition = useRef(false);
   const finished = useRef(false);
   const helpId = useId();
-  const [, fontsLoaded] = useState(0);
+  const [fontVersion, fontsLoaded] = useState(0);
   const metrics = textMetrics({ ...annotation, text: value });
-  const frame = textFrame({ ...annotation, text: value || 'Text' });
+  const frame = textLayout({ ...annotation, text: value });
   const zoom = Math.max(0.01, scale);
   const caretSpace = Math.max(2 / zoom, metrics.letterSpacing, 0);
   const topOffset = lineBoxOffset(metrics.font, metrics.lineStep);
@@ -52,8 +53,24 @@ export default function InlineTextEditor({
   }, []);
 
   useLayoutEffect(() => {
+    const canvas = preview.current;
+    if (!canvas) return;
+    const resolution = Math.max(1, zoom * (window.devicePixelRatio || 1));
+    canvas.width = Math.max(1, Math.ceil(frame.width * resolution));
+    canvas.height = Math.max(1, Math.ceil(frame.height * resolution));
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    // A new text layer starts with just the native caret. Its treatment appears
+    // with the first character, using the same painter as the saved annotation.
+    if (!value) return;
+    context.scale(resolution, resolution);
+    drawTextAnnotation(context, { ...annotation, x: 0, y: 0, text: value });
+  }, [annotation, value, zoom, frame.width, frame.height, fontVersion]);
+
+  useLayoutEffect(() => {
     const element = input.current;
     if (!element) return;
+    finished.current = false;
     element.focus({ preventScroll: true });
     if (isNew) element.setSelectionRange(element.value.length, element.value.length);
     else element.select();
@@ -86,58 +103,61 @@ export default function InlineTextEditor({
         height: frame.height,
         transform: `scale(${zoom})`,
         transformOrigin: 'top left',
-        outline: `${1 / zoom}px solid var(--color-accent, #6244e0)`,
+        outline: value ? `${1 / zoom}px solid var(--color-accent, #6244e0)` : 'none',
         outlineOffset: `${2 / zoom}px`,
         pointerEvents: 'none',
         zIndex: 5,
       }}
     >
+      <canvas
+        ref={preview}
+        aria-hidden="true"
+        style={{ position: 'absolute', left: 0, top: 0, width: frame.width, height: frame.height, pointerEvents: 'none' }}
+      />
       <textarea
         ref={input}
         aria-label="Annotation text"
         aria-describedby={helpId}
-        placeholder="Text"
         value={value}
         rows={1}
         wrap="off"
         spellCheck={false}
         autoComplete="off"
         autoCapitalize="off"
-        className="placeholder:opacity-40 placeholder:text-current selection:bg-accent/20"
+        className="selection:bg-accent/20"
         onChange={event => onChange(event.target.value)}
         onPointerDown={event => event.stopPropagation()}
         onPointerMove={event => event.stopPropagation()}
         onPointerUp={event => event.stopPropagation()}
         onDoubleClick={event => event.stopPropagation()}
-        onCompositionStart={() => { composing.current = true; }}
+        onCompositionStart={() => { composing.current = true; blurredDuringComposition.current = false; }}
         onCompositionEnd={event => {
           composing.current = false;
           onChange(event.currentTarget.value);
           if (blurredDuringComposition.current) finish();
         }}
-          onBlur={() => {
-            // Professional: click outside commits immediately (Figma/CleanShot style)
-            if (composing.current) blurredDuringComposition.current = true;
-            else finish();
-          }}
-          onKeyDown={event => {
-            event.stopPropagation();
-            if (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
-            if (event.key === 'Escape') {
-              event.preventDefault();
-              finish(true);
-            } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-              event.preventDefault();
-              finish();
-            }
-          }}
+        onBlur={() => {
+          if (composing.current) blurredDuringComposition.current = true;
+          else finish();
+        }}
+        onKeyDown={event => {
+          event.stopPropagation();
+          if (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            finish(isNew && !value.trim());
+          } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault();
+            finish();
+          }
+        }}
         style={{
           position: 'absolute',
-          left: 0,
-          top: topOffset,
+          left: frame.paddingX,
+          top: frame.paddingY + topOffset,
           display: 'block',
-          width: frame.width,
-          height: frame.height + Math.max(0, -topOffset),
+          width: frame.contentWidth,
+          height: frame.contentHeight + Math.max(0, -topOffset),
           minWidth: 0,
           minHeight: 0,
           margin: 0,
@@ -150,10 +170,12 @@ export default function InlineTextEditor({
           outline: 'none',
           background: 'transparent',
           boxShadow: 'none',
-          color: annotation.color,
-          opacity: (annotation.opacity ?? 100) / 100,
+          // The canvas paints the styled text; this transparent native control
+          // supplies the caret, selection, keyboard navigation and IME support.
+          color: 'transparent',
+          WebkitTextFillColor: 'transparent',
           caretColor: 'var(--color-accent, #6244e0)',
-          fontFamily: textStack(annotation.fontFamily),
+          fontFamily: textStack(metrics.family),
           fontSize: metrics.size,
           fontWeight: metrics.weight,
           fontKerning: metrics.letterSpacing ? 'none' : 'normal',
@@ -168,7 +190,7 @@ export default function InlineTextEditor({
           cursor: 'text',
         }}
       />
-        <span id={helpId} className="sr-only">Enter for a new line. Ctrl/Cmd+Enter to finish. Escape to cancel.</span>
+      <span id={helpId} className="sr-only">Enter for a new line. Escape or Ctrl/Cmd+Enter to finish.</span>
     </div>
   );
 }

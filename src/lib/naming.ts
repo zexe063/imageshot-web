@@ -6,7 +6,8 @@ const LAYER_LABELS: Record<string, string> = {
   pen: 'Vector',
   text: 'Text',
   highlight: 'Highlight',
-  blur: 'Pixelate',
+  blur: 'Blur',
+  spotlight: 'Spotlight',
   number: 'Step',
   arrow: 'Line',
 };
@@ -19,6 +20,7 @@ export function layerLabel(type: string) {
 export function layerDisplayName(annotation: Annotation, index = 1) {
   if (annotation.type === 'text') return (annotation.text || 'Text').slice(0, 24) || 'Text';
   if (annotation.type === 'number') return `Step ${annotation.number || 1}`;
+  if (annotation.type === 'blur' && annotation.blurMode !== 'blur') return `Pixelate ${index}`;
   if (annotation.type === 'arrow' && annotation.arrowStyle === 'curved') return `Curved line ${index}`;
 
   return `${layerLabel(annotation.type)} ${index}`;

@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
-import type { Annotation, ArrowDefaults, CompositionStyle, Point, Tool } from '../lib/editor-types';
+import type { Annotation, ArrowDefaults, CompositionStyle, Point, StepDefaults, Tool } from '../lib/editor-types';
 import { annotationBounds, arrowBendPoint, arrowCurveAt, arrowGeometry, getCompositionSize, markerWidth, renderComposition, strokePath, textFrame } from '../lib/render';
 import { distanceToLine, resizeBox, selectionBounds, transformAnnotation } from '../lib/selection';
 import type { Box, Handle } from '../lib/selection';
 import InlineTextEditor from './InlineTextEditor';
+import { DEFAULT_STEP_SIZE, stepNumber } from '../lib/steps';
+import { createTextRowDetector } from '../lib/smart-highlight';
+import type { TextRow } from '../lib/smart-highlight';
+import { MIN_CROP_SIZE, cropAnnotations, cropPixelBounds, moveCropBox, resizeCropBox } from '../lib/crop';
 
 export interface EditorCanvasProps {
   image: HTMLImageElement | null;
@@ -21,6 +25,8 @@ export interface EditorCanvasProps {
   onArrowChange?: (patch: Partial<Annotation>) => void;
   textSize: number;
   textStyle?: Partial<Annotation>;
+  step?: StepDefaults;
+  nextStepNumber?: number;
   style: CompositionStyle;
   zoom: number;
   onToolChange?: (tool: Tool) => void;
@@ -30,11 +36,12 @@ export interface EditorCanvasProps {
   onZoomChange?: (actualZoom: number) => void;
 }
 interface Gesture {
-  mode: 'draw' | 'move' | 'resize' | 'bend' | 'endpoint' | 'crop' | 'marquee';
+  mode: 'draw' | 'move' | 'resize' | 'bend' | 'endpoint' | 'crop' | 'crop-move' | 'crop-resize' | 'marquee';
   pointerId: number; start: Point; rect: DOMRect; scale: number;
   base: Annotation[]; bounds?: Box; handle?: Handle; endpoint?: 'tail' | 'tip';
   points?: Point[]; anchor?: Point; snapped?: boolean;
   initialSelection: string[]; freehand?: boolean; moved?: boolean;
+  textRow?: TextRow | null; lastTextProbe?: number;
 }
 interface TextEditor { annotation: Annotation; value: string; isNew: boolean }
 interface Guide { from: Point; to: Point }
@@ -49,7 +56,7 @@ function contains(a: Annotation, point: Point, tolerance: number) {
     return path.some((p, i) => distanceToLine(point, path[Math.max(0, i - 1)], p) <= reach);
   }
   const b = annotationBounds(a);
-  if (a.type === 'ellipse') return ((point.x - b.x - b.width / 2) / (b.width / 2 + tolerance)) ** 2 + ((point.y - b.y - b.height / 2) / (b.height / 2 + tolerance)) ** 2 <= 1;
+  if (a.type === 'ellipse' || a.type === 'number') return ((point.x - b.x - b.width / 2) / (b.width / 2 + tolerance)) ** 2 + ((point.y - b.y - b.height / 2) / (b.height / 2 + tolerance)) ** 2 <= 1;
   return point.x >= b.x - tolerance && point.x <= b.x + b.width + tolerance && point.y >= b.y - tolerance && point.y <= b.y + b.height + tolerance;
 }
 function tracedAnnotation(base: Annotation, points: Point[]): Annotation {
@@ -63,12 +70,14 @@ function snapAngle(start: Point, point: Point): Point {
   return { x: start.x + Math.cos(angle) * length, y: start.y + Math.sin(angle) * length };
 }
 
-export function EditorCanvas({ image, annotations, onChange, selectedId, selectedIds, onSelect, onSelectionChange, tool, color, strokeWidth, arrow, onArrowChange, textSize, textStyle, style, zoom, onToolChange, onCrop, onStatus, loadingMessage, onZoomChange }: EditorCanvasProps) {
+export function EditorCanvas({ image, annotations, onChange, selectedId, selectedIds, onSelect, onSelectionChange, tool, color, strokeWidth, arrow, onArrowChange, textSize, textStyle, step, nextStepNumber = 1, style, zoom, onToolChange, onCrop, onStatus, loadingMessage, onZoomChange }: EditorCanvasProps) {
   const viewportRef = useRef<HTMLDivElement>(null), artboardRef = useRef<HTMLDivElement>(null), canvasRef = useRef<HTMLCanvasElement>(null);
   const gestureRef = useRef<Gesture | null>(null), draftsRef = useRef<Annotation[]>([]), draftFrame = useRef(0), textEditorRef = useRef<TextEditor | null>(null);
   const [viewport, setViewport] = useState({ width: 1000, height: 700 });
   const [drafts, setDraftState] = useState<Annotation[]>([]);
-  const [crop, setCrop] = useState<Box | null>(null), [marquee, setMarquee] = useState<Box | null>(null);
+  const [crop, setCropState] = useState<Box | null>(null), [marquee, setMarquee] = useState<Box | null>(null);
+  const cropRef = useRef<Box | null>(null);
+  const setCrop = (next: Box | null) => { cropRef.current = next; setCropState(next); };
   const [hoveredId, setHoveredId] = useState<string | null>(null), [textEditor, setTextEditorState] = useState<TextEditor | null>(null);
   const [guides, setGuides] = useState<Guide[]>([]);
   const ids = selectedIds ?? (selectedId ? [selectedId] : []);
@@ -93,6 +102,7 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
     return () => { observer.disconnect(); cancelAnimationFrame(frame); cancelAnimationFrame(draftFrame.current); };
   }, []);
   const size = useMemo(() => image ? getCompositionSize(image, style) : null, [image, style]);
+  const detectRow = useMemo(() => image ? createTextRowDetector(image) : null, [image]);
   const fit = size ? Math.min(1, Math.max(80, viewport.width - CANVAS_INSET * 2 - 17) / size.width, size.height > size.width * 2 ? 1 : Math.max(80, viewport.height - CANVAS_INSET * 2 - 17) / size.height) : 1;
   const displayScale = fit * Math.max(0.1, zoom);
   useEffect(() => { onZoomChange?.(displayScale); }, [displayScale, onZoomChange]);
@@ -112,12 +122,36 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
     setDrafts([], true); setCrop(null); setMarquee(null); setGuides([]);
     if (gesture) selectIds(gesture.initialSelection);
   };
+  const cancelCrop = () => { cancelGesture(); onToolChange?.('select'); };
+  const applyCrop = () => {
+    if (!image || !size || !cropRef.current || !onCrop || gestureRef.current) return;
+    const box = cropPixelBounds(cropRef.current, size.imageWidth, size.imageHeight);
+    if (box.width < MIN_CROP_SIZE || box.height < MIN_CROP_SIZE) return;
+    try {
+      const cropped = document.createElement('canvas'); cropped.width = box.width; cropped.height = box.height;
+      const context = cropped.getContext('2d');
+      if (!context) throw new Error('Canvas is unavailable');
+      context.drawImage(image, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
+      onCrop(cropped.toDataURL('image/png'), cropAnnotations(annotations, box));
+      setCrop(null); onSelect(null); onToolChange?.('select');
+    } catch { onStatus?.('Could not crop this image. Please try again.'); }
+  };
   useEffect(() => { gestureRef.current = null; setDrafts([], true); setCrop(null); setMarquee(null); setTextEditor(null); setGuides([]); }, [image]);
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape' && gestureRef.current) { event.preventDefault(); event.stopImmediatePropagation(); cancelGesture(); } };
+    // Undo or a document change invalidates a pending crop against the old layers.
+    if (gestureRef.current?.mode.startsWith('crop')) cancelGesture(); else setCrop(null);
+  }, [annotations]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.target as HTMLElement)?.closest('input,textarea,select,[contenteditable="true"]')) return;
+      if (tool === 'crop' && (event.key === 'Escape' || (event.key === 'Enter' && cropRef.current))) {
+        event.preventDefault(); event.stopImmediatePropagation();
+        if (event.key === 'Escape') cancelCrop(); else applyCrop();
+      } else if (event.key === 'Escape' && gestureRef.current) { event.preventDefault(); event.stopImmediatePropagation(); cancelGesture(); }
+    };
     window.addEventListener('keydown', onKey, true); return () => window.removeEventListener('keydown', onKey, true);
   });
-  useEffect(() => { if (gestureRef.current) cancelGesture(); setHoveredId(null); }, [tool]);
+  useEffect(() => { if (gestureRef.current) cancelGesture(); if (tool !== 'crop') setCrop(null); setHoveredId(null); }, [tool]);
   const coordinates = (event: { clientX: number; clientY: number }, clamp = false): Point => {
     const gesture = gestureRef.current, rect = gesture?.rect ?? artboardRef.current!.getBoundingClientRect(), scale = gesture?.scale ?? displayScale;
     const x = (event.clientX - rect.left) / scale - (size?.imageX || 0), y = (event.clientY - rect.top) / scale - (size?.imageY || 0);
@@ -128,18 +162,20 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
     if (!editor) return;
     if (value !== undefined) editor.value = value;
     setTextEditor(null);
+    onToolChange?.('select');
     if (!editor.value.trim()) { if (!editor.isNew) onChange(annotations.filter(a => a.id !== editor.annotation.id)); onSelect(null); return; }
     const annotation = { ...editor.annotation, text: editor.value, ...textFrame({ ...editor.annotation, text: editor.value }) };
     if (editor.isNew || annotation.text !== editor.annotation.text) onChange(editor.isNew ? [...annotations, annotation] : annotations.map(a => a.id === annotation.id ? annotation : a));
-    onSelect(annotation.id); onToolChange?.('select');
+    onSelect(annotation.id);
   };
   useEffect(() => {
     const editor = textEditorRef.current;
     if (!editor) return;
-    const source = editor.isNew ? { ...editor.annotation, color: textStyle?.color ?? '#000000', fontSize: textSize,
+    const source = editor.isNew ? { ...editor.annotation, color: textStyle?.color ?? '#000000', opacity: textStyle?.opacity ?? 100, fontSize: textSize,
       fontFamily: textStyle?.fontFamily, fontWeight: textStyle?.fontWeight, lineHeight: textStyle?.lineHeight,
-      letterSpacing: textStyle?.letterSpacing, align: textStyle?.align } : annotations.find(a => a.id === editor.annotation.id);
-    const keys: (keyof Annotation)[] = ['color', 'fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'letterSpacing', 'align', 'opacity', 'x', 'y'];
+      letterSpacing: textStyle?.letterSpacing, align: textStyle?.align,
+      textPreset: textStyle?.textPreset, textBackground: textStyle?.textBackground, textOutline: textStyle?.textOutline } : annotations.find(a => a.id === editor.annotation.id);
+    const keys: (keyof Annotation)[] = ['color', 'fontSize', 'fontFamily', 'fontWeight', 'lineHeight', 'letterSpacing', 'align', 'opacity', 'x', 'y', 'textPreset', 'textBackground', 'textOutline'];
     if (source && keys.some(key => source[key] !== editor.annotation[key])) setTextEditor({ ...editor, annotation: source });
   }, [annotations, textStyle, textSize]);
   useEffect(() => {
@@ -153,12 +189,16 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
   }, [annotations, selectedId]);
   const pointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!image || !size || event.button !== 0 || textEditorRef.current || gestureRef.current) return;
+    event.currentTarget.focus({ preventScroll: true });
     const point = coordinates(event), target = event.target as Element;
     const selected = annotations.filter(a => ids.includes(a.id) && !a.hidden && !a.locked);
     const start = (mode: Gesture['mode'], base: Annotation[] = [], extra: Partial<Gesture> = {}) => {
       event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); setHoveredId(null);
       gestureRef.current = { mode, pointerId: event.pointerId, start: point, rect: event.currentTarget.getBoundingClientRect(), scale: displayScale, base, initialSelection: [...ids], ...extra };
     };
+    const cropHandle = target.getAttribute('data-crop-handle') as Handle | null;
+    if (tool === 'crop' && cropRef.current && cropHandle) { start('crop-resize', [], { handle: cropHandle, bounds: cropRef.current }); return; }
+    if (tool === 'crop' && cropRef.current && target.hasAttribute('data-crop-move')) { start('crop-move', [], { bounds: cropRef.current }); return; }
     const handle = target.getAttribute('data-handle') as Handle | null, endpoint = target.getAttribute('data-endpoint') as 'tail' | 'tip' | null;
     if (handle && selected.length && !selected.some(a => a.type === 'highlight')) { start('resize', selected, { handle, bounds: selectionBounds(selected)! }); setDrafts(selected); return; }
     if (endpoint && selected.length === 1 && selected[0].type === 'arrow') { start('endpoint', selected, { endpoint }); setDrafts(selected); return; }
@@ -181,26 +221,34 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
     if (tool === 'arrow') Object.assign(annotation, arrow);
     if (tool === 'text') {
       event.preventDefault();
-      Object.assign(annotation, { color: textStyle?.color ?? '#000000', fontSize: textSize, fontFamily: textStyle?.fontFamily, fontWeight: textStyle?.fontWeight, lineHeight: textStyle?.lineHeight, letterSpacing: textStyle?.letterSpacing, align: textStyle?.align });
+      const existing = [...annotations].reverse().find(a => a.type === 'text' && contains(a, point, 4 / displayScale));
+      if (existing) { setTextEditor({ annotation: existing, value: existing.text || '', isNew: false }); onSelect(existing.id); return; }
+      Object.assign(annotation, { color: textStyle?.color ?? '#000000', opacity: textStyle?.opacity ?? 100, fontSize: textSize, fontFamily: textStyle?.fontFamily, fontWeight: textStyle?.fontWeight, lineHeight: textStyle?.lineHeight, letterSpacing: textStyle?.letterSpacing, align: textStyle?.align, textPreset: textStyle?.textPreset, textBackground: textStyle?.textBackground, textOutline: textStyle?.textOutline });
       Object.assign(annotation, textFrame(annotation)); setTextEditor({ annotation, value: '', isNew: true }); onSelect(null); return;
     }
     if (tool === 'number') {
-      const diameter = Math.max(36, textSize * 1.4);
-      Object.assign(annotation, { x: point.x - diameter / 2, y: point.y - diameter / 2, width: diameter, height: diameter, number: 1 + Math.max(0, ...annotations.filter(a => a.type === 'number').map(a => a.number || 0)) });
+      event.preventDefault();
+      const diameter = Math.min(size.imageWidth, size.imageHeight, Math.max(16, step?.stepSize ?? DEFAULT_STEP_SIZE));
+      Object.assign(annotation, { x: Math.max(0, Math.min(size.imageWidth - diameter, point.x - diameter / 2)), y: Math.max(0, Math.min(size.imageHeight - diameter, point.y - diameter / 2)), width: diameter, height: diameter, number: stepNumber(nextStepNumber), stepStyle: step?.stepStyle ?? 'filled', opacity: textStyle?.opacity ?? 100 });
       onChange([...annotations, annotation]); onSelect(annotation.id); return;
     }
+    if (tool === 'blur') Object.assign(annotation, { blurMode: textStyle?.blurMode ?? 'pixelate', blurAmount: textStyle?.blurAmount ?? 16 });
+    if (tool === 'spotlight') Object.assign(annotation, { spotlightShape: textStyle?.spotlightShape ?? 'rectangle', spotlightDim: textStyle?.spotlightDim ?? 65 });
+    if (tool === 'highlight') annotation.highlightMode = textStyle?.highlightMode ?? 'text';
     const traced = tool === 'pen' || tool === 'highlight';
     if (traced) annotation.points = [{ x: 0, y: 0 }];
-    start('draw', [annotation], { points: traced ? [point] : undefined, freehand: event.altKey }); setDrafts([annotation]); onSelect(annotation.id);
+    start('draw', [annotation], { points: traced ? [point] : undefined, freehand: event.altKey || annotation.highlightMode === 'freehand' }); setDrafts([annotation]); onSelect(annotation.id);
   };
   const pointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     const gesture = gestureRef.current;
     if (!size) return;
     if (!gesture) { if (tool === 'select' && !textEditor) setHoveredId([...annotations].reverse().find(a => contains(a, coordinates(event), 5 / displayScale))?.id ?? null); return; }
     if (event.pointerId !== gesture.pointerId) return;
-    const point = coordinates(event, gesture.mode === 'draw' || gesture.mode === 'crop'), dx = point.x - gesture.start.x, dy = point.y - gesture.start.y;
+    const point = coordinates(event, gesture.mode === 'draw' || gesture.mode.startsWith('crop')), dx = point.x - gesture.start.x, dy = point.y - gesture.start.y;
     gesture.moved ||= Math.hypot(dx, dy) * gesture.scale > 2;
     setGuides([]);
+    if (gesture.mode === 'crop-move' && gesture.bounds) { setCrop(moveCropBox(gesture.bounds, dx, dy, size.imageWidth, size.imageHeight)); return; }
+    if (gesture.mode === 'crop-resize' && gesture.bounds && gesture.handle) { setCrop(resizeCropBox(gesture.bounds, gesture.handle, point, size.imageWidth, size.imageHeight)); return; }
     if (gesture.mode === 'marquee' || gesture.mode === 'crop') {
       const box = { x: Math.min(gesture.start.x, point.x), y: Math.min(gesture.start.y, point.y), width: Math.abs(dx), height: Math.abs(dy) };
       if (gesture.mode === 'crop') setCrop(box);
@@ -228,7 +276,7 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
       }
       setGuides(guides); setDrafts(gesture.base.map(a => ({ ...a, x: a.x + mx, y: a.y + my })));
     } else if (gesture.mode === 'resize' && gesture.handle && gesture.bounds) {
-      const next = resizeBox(gesture.bounds, gesture.handle, point, event.shiftKey || gesture.base.some(a => a.type === 'text'), event.altKey);
+      const next = resizeBox(gesture.bounds, gesture.handle, point, event.shiftKey || gesture.base.some(a => a.type === 'text') || (gesture.base.length === 1 && base.type === 'number'), event.altKey);
       setDrafts(gesture.base.map(a => transformAnnotation(a, gesture.bounds!, next)));
     } else if (gesture.mode === 'bend') {
       if (!gesture.moved) return;
@@ -252,13 +300,20 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
       for (const sample of samples.length ? samples : [event]) { const next = coordinates(sample, true), last = points.at(-1)!; if (Math.hypot(next.x - last.x, next.y - last.y) >= 0.6 / gesture.scale) points.push(next); }
       // Keep raw samples: Alt or leaving the row instantly restores freehand ink.
       const row = base.type === 'highlight' && !gesture.freehand && Math.abs(dx) * gesture.scale >= 12 && Math.abs(dy) <= Math.max(6 / gesture.scale, Math.abs(dx) * 0.22) && points.every(p => Math.abs(p.y - gesture.start.y) <= Math.max(8 / gesture.scale, Math.abs(dx) * 0.24));
-      const path = row ? [gesture.start, { x: point.x, y: gesture.start.y }] : points;
-      if (row) setGuides([{ from: gesture.start, to: path[1] }]);
-      setDrafts([tracedAnnotation(base, path)]);
+      // Probe only until a confident row is found, then keep that text size stable.
+      // Leaving the row or holding Alt restores the original manual-width stroke.
+      if (row && !gesture.textRow && (gesture.lastTextProbe === undefined || Math.abs(dx - gesture.lastTextProbe) >= 32)) {
+        gesture.textRow = detectRow?.(gesture.start, point, markerWidth(base)); gesture.lastTextProbe = dx;
+      }
+      const centerY = gesture.textRow?.centerY ?? gesture.start.y;
+      const path = row ? [{ x: gesture.start.x, y: centerY }, { x: point.x, y: centerY }] : points;
+      if (row) setGuides([{ from: path[0], to: path[1] }]);
+      const marker = row && gesture.textRow ? { ...base, strokeWidth: gesture.textRow.height / 4 } : base;
+      setDrafts([tracedAnnotation(marker, path)]);
     } else {
       let width = dx, height = dy;
       // Figma-style: Shift = square/circle, Alt = draw from center
-      const isShape = ['rectangle', 'ellipse'].includes(base.type);
+      const isShape = ['rectangle', 'ellipse', 'spotlight'].includes(base.type);
       if (isShape && event.shiftKey) { const side = Math.max(Math.abs(dx), Math.abs(dy)); width = side * (dx < 0 ? -1 : 1); height = side * (dy < 0 ? -1 : 1); }
       if (event.altKey && isShape) {
         const ax = gesture.start.x - width, ay = gesture.start.y - height;
@@ -272,28 +327,25 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
   const pointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
     const gesture = gestureRef.current; if (!gesture || gesture.pointerId !== event.pointerId) return;
     pointerMove(event); // Preserve the release position even if the last move was coalesced.
-    const end = coordinates(event, gesture.mode === 'crop'); gestureRef.current = null;
+    gestureRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     setGuides([]); setMarquee(null); if (gesture.mode === 'marquee') return;
-    if (gesture.mode === 'crop' && image && size) {
-      const x = Math.floor(Math.min(gesture.start.x, end.x)), y = Math.floor(Math.min(gesture.start.y, end.y)), width = Math.floor(Math.abs(end.x - gesture.start.x)), height = Math.floor(Math.abs(end.y - gesture.start.y));
-      setCrop(null); if (width < 8 || height < 8) return;
-      const cropped = document.createElement('canvas'); cropped.width = width; cropped.height = height;
-      const context = cropped.getContext('2d'); if (!context) { onStatus?.('Could not crop this image. Please try again.'); return; }
-      context.drawImage(image, x, y, width, height, 0, 0, width, height);
-      const retained = annotations.filter(a => { const b = annotationBounds(a); return b.x + b.width > x && b.x < x + width && b.y + b.height > y && b.y < y + height; }).map(a => ({ ...a, x: a.x - x, y: a.y - y }));
-      onCrop?.(cropped.toDataURL('image/png'), retained); onSelect(null); onToolChange?.('select'); return;
+    if (gesture.mode.startsWith('crop')) {
+      if (cropRef.current && (cropRef.current.width < MIN_CROP_SIZE || cropRef.current.height < MIN_CROP_SIZE)) {
+        setCrop(gesture.bounds ?? null); onStatus?.('Choose a crop area at least 8 pixels wide and tall.');
+      } else setCrop(cropRef.current);
+      return;
     }
     const completed = draftsRef.current; setDrafts([], true);
     if (!completed.length || (gesture.mode !== 'draw' && !gesture.moved)) return;
     if (gesture.mode === 'draw' && !['pen', 'highlight'].includes(completed[0].type) && Math.hypot(completed[0].width, completed[0].height) < 4 / gesture.scale) { onSelect(null); return; }
     // Stroke bounds include ink thickness; copying them into x/y shifts every point.
-    const normalized = completed.map(a => ['rectangle', 'ellipse', 'blur'].includes(a.type) ? { ...a, ...annotationBounds(a) } : a), replacements = new Map(normalized.map(a => [a.id, a]));
+    const normalized = completed.map(a => ['rectangle', 'ellipse', 'blur', 'spotlight'].includes(a.type) ? { ...a, ...annotationBounds(a) } : a), replacements = new Map(normalized.map(a => [a.id, a]));
     onChange(gesture.mode === 'draw' ? [...annotations, ...normalized] : annotations.map(a => replacements.get(a.id) || a));
     // Professional behaviour (Figma / CleanShot): after placing a shape/arrow, return to Select
     // so the next drag moves the new layer instead of drawing another one. Pen/highlight stay
     // active for continuous strokes.
-    if (gesture.mode === 'draw' && ['rectangle', 'ellipse', 'arrow', 'blur', 'text'].includes(completed[0].type)) {
+    if (gesture.mode === 'draw' && ['rectangle', 'ellipse', 'arrow', 'blur', 'spotlight', 'text'].includes(completed[0].type)) {
       onToolChange?.('select');
     }
   };
@@ -301,7 +353,7 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
   const selection = selectionBounds(selectedItems), locked = selectedItems.some(a => a.locked), drawing = gestureRef.current?.mode === 'draw';
   const markerSelected = selected?.type === 'highlight';
   const canResize = !selectedItems.some(a => a.type === 'highlight');
-  const showSelection = selection && !textEditor && !crop && !drawing && !marquee;
+  const showSelection = selection && !textEditor && tool !== 'crop' && !drawing && !marquee;
   const hovered = !gestureRef.current && !ids.includes(hoveredId || '') ? annotations.find(a => a.id === hoveredId && !a.hidden) : undefined, hoverBox = hovered ? annotationBounds(hovered) : null;
   // Only the four corners resize. The mid-edge handles are gone, so a shape is
   // resized from a corner the way CleanShot does it.
@@ -310,6 +362,11 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
     { key: 'ne', x: selection.x + selection.width, y: selection.y },
     { key: 'se', x: selection.x + selection.width, y: selection.y + selection.height },
     { key: 'sw', x: selection.x, y: selection.y + selection.height },
+  ] : [];
+  const cropHandles: { key: Handle; x: number; y: number }[] = crop ? [
+    { key: 'nw', x: crop.x, y: crop.y }, { key: 'n', x: crop.x + crop.width / 2, y: crop.y }, { key: 'ne', x: crop.x + crop.width, y: crop.y },
+    { key: 'e', x: crop.x + crop.width, y: crop.y + crop.height / 2 }, { key: 'se', x: crop.x + crop.width, y: crop.y + crop.height },
+    { key: 's', x: crop.x + crop.width / 2, y: crop.y + crop.height }, { key: 'sw', x: crop.x, y: crop.y + crop.height }, { key: 'w', x: crop.x, y: crop.y + crop.height / 2 },
   ] : [];
   const selectedArrow = selected?.type === 'arrow' && !locked ? selected : undefined;
   const arrowTail = selectedArrow ? { x: selectedArrow.x, y: selectedArrow.y } : null;
@@ -321,10 +378,13 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
   return (
     <div ref={viewportRef} data-testid="editor-viewport" className="flex-1 w-full h-full min-w-0 min-h-0 overflow-auto scrollbar-none relative overscroll-contain" style={{ overflowAnchor: 'none' }}>
       <div className="flex items-center justify-center w-max min-w-full min-h-full box-border" style={{ padding: CANVAS_INSET }}>
-        {image && size ? <div ref={artboardRef} data-testid="editor-artboard" className="relative shrink-0 touch-none select-none" role="application" aria-label="Screenshot canvas. Drag to draw, select a layer, or drag empty space to select several layers."
+        {image && size ? <div ref={artboardRef} data-testid="editor-artboard" tabIndex={0} className="relative shrink-0 touch-none select-none outline-none" role="application" aria-label="Screenshot canvas. Drag to draw, select a layer, or drag empty space to select several layers."
           onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={cancelGesture} onLostPointerCapture={() => { if (gestureRef.current) cancelGesture(); }} onPointerLeave={() => setHoveredId(null)} onDragStart={event => event.preventDefault()}
           onDoubleClick={event => {
-            if ((event.target as Element).hasAttribute('data-bend')) {
+            const point = coordinates(event);
+            // Pointer capture can retarget a click from the handle to the artboard.
+            // Use the handle's hit area as well, so a double-click still straightens it.
+            if (selectedArrow && bendHandle && ((event.target as Element).hasAttribute('data-bend') || Math.hypot(point.x - bendHandle.x, point.y - bendHandle.y) <= 11 / displayScale)) {
               // Double-clicking the middle handle takes the bow away, the way
               // double-clicking a modifier resets it elsewhere in the app.
               onChange(annotations.map(a => a.id === selectedArrow?.id ? { ...a, arrowStyle: 'straight', curve: 0 } : a));
@@ -361,17 +421,30 @@ export function EditorCanvas({ image, annotations, onChange, selectedId, selecte
                 </>
               )}
             </>}
-            {hoverBox && hovered?.type !== 'highlight' && !textEditor && <rect data-testid="hover-outline" {...hoverBox} fill="none" stroke={ACCENT} strokeWidth={1 / displayScale} opacity={0.65} />}
+            {tool !== 'crop' && hoverBox && hovered?.type !== 'highlight' && !textEditor && <rect data-testid="hover-outline" {...hoverBox} fill="none" stroke={ACCENT} strokeWidth={1 / displayScale} opacity={0.65} />}
             {guides.map((g, i) => <line key={i} data-testid="editor-axis-guide" x1={g.from.x} y1={g.from.y} x2={g.to.x} y2={g.to.y} stroke={ACCENT} strokeWidth={1 / displayScale} strokeDasharray={`${4 / displayScale} ${4 / displayScale}`} opacity={0.7} />)}
             {marquee && <rect data-testid="selection-marquee" {...marquee} fill="rgba(98,68,224,0.10)" stroke={ACCENT} strokeWidth={1 / displayScale} />}
-            {crop && <><path d={`M 0 0 H ${size.imageWidth} V ${size.imageHeight} H 0 Z M ${crop.x} ${crop.y} V ${crop.y + crop.height} H ${crop.x + crop.width} V ${crop.y} Z`} fill="rgba(30,30,38,0.5)" fillRule="evenodd" /><rect {...crop} fill="none" stroke="white" strokeWidth={1.5 / displayScale} strokeDasharray={`${6 / displayScale} ${4 / displayScale}`} /><path d={`M ${crop.x + crop.width / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x + crop.width * 2 / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x} ${crop.y + crop.height / 3} H ${crop.x + crop.width} M ${crop.x} ${crop.y + crop.height * 2 / 3} H ${crop.x + crop.width}`} fill="none" stroke="rgba(255,255,255,.4)" strokeWidth={0.5 / displayScale} /></>}
+            {crop && <>
+              <path d={`M 0 0 H ${size.imageWidth} V ${size.imageHeight} H 0 Z M ${crop.x} ${crop.y} V ${crop.y + crop.height} H ${crop.x + crop.width} V ${crop.y} Z`} fill="rgba(30,30,38,0.55)" fillRule="evenodd" />
+              <rect data-testid="crop-selection" data-crop-move="true" {...crop} fill="transparent" stroke="white" strokeWidth={1.5 / displayScale} style={{ pointerEvents: 'all', cursor: 'move' }} />
+              <path d={`M ${crop.x + crop.width / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x + crop.width * 2 / 3} ${crop.y} V ${crop.y + crop.height} M ${crop.x} ${crop.y + crop.height / 3} H ${crop.x + crop.width} M ${crop.x} ${crop.y + crop.height * 2 / 3} H ${crop.x + crop.width}`} fill="none" stroke="rgba(255,255,255,.4)" strokeWidth={0.5 / displayScale} />
+              {cropHandles.map(handle => <g key={handle.key}>
+                <rect data-crop-handle={handle.key} x={handle.x - 9 / displayScale} y={handle.y - 9 / displayScale} width={18 / displayScale} height={18 / displayScale} fill="transparent" style={{ pointerEvents: 'all', cursor: `${handle.key}-resize` }} />
+                <rect x={handle.x - 3.5 / displayScale} y={handle.y - 3.5 / displayScale} width={7 / displayScale} height={7 / displayScale} rx={1 / displayScale} fill="white" stroke={ACCENT} strokeWidth={1 / displayScale} />
+              </g>)}
+            </>}
           </g></svg>
           {showSelection && selection && !selectedArrow && !markerSelected && <div data-testid="selection-size" className="absolute pointer-events-none whitespace-nowrap rounded-[3px] bg-accent px-1.5 py-0.5 text-[10px] text-white" style={{ left: (size.imageX + selection.x + selection.width / 2) * displayScale, top: (size.imageY + selection.y + selection.height) * displayScale + 10, transform: 'translateX(-50%)' }}>{Math.round(selection.width)} × {Math.round(selection.height)}{selectedItems.length > 1 ? ` · ${selectedItems.length} layers` : ''}</div>}
 
           {textEditor && <InlineTextEditor annotation={textEditor.annotation} value={textEditor.value} isNew={textEditor.isNew} scale={displayScale} imageX={size.imageX} imageY={size.imageY} onChange={value => setTextEditor({ ...textEditor, value })} onCommit={commitText} onCancel={() => { const id = textEditor.isNew ? null : textEditor.annotation.id; setTextEditor(null); onSelect(id); onToolChange?.('select'); }} />}
         </div> : <div className="flex flex-col items-center gap-2 text-center text-ink-3"><strong className="text-[13px] font-medium text-ink">{loadingMessage ? 'Opening your screenshot' : 'No image loaded'}</strong><span className="text-app">{loadingMessage ?? 'Drop a screenshot here, or import one from the file menu.'}</span></div>}
       </div>
-      {!textEditor && ['highlight', 'pen', 'select', 'arrow', 'rectangle', 'ellipse', 'text'].includes(tool) && <div className="sticky bottom-3 mx-auto w-fit max-w-[90%] pointer-events-none rounded-md bg-white/90 px-3 py-1.5 text-[10px] text-ink-2 shadow-sm" style={{ marginTop: -30 }}>{tool === 'highlight' ? 'Snap to a row · Alt to draw freely · Shift for 45°' : tool === 'pen' ? 'Draw freely · Shift for a straight stroke · Esc to cancel' : tool === 'arrow' ? 'Drag to draw · Drag the middle dot to curve · Shift for 45°' : tool === 'rectangle' || tool === 'ellipse' ? 'Drag to draw · Shift for square · Alt from center · Esc to cancel' : tool === 'text' ? 'Click to type · Drag a corner to resize · Esc to finish' : 'Drag to select · Shift-click to add · Arrow keys to nudge'}</div>}
+      {image && tool === 'crop' && <div role="group" aria-label="Crop controls" className="sticky bottom-3 mx-auto flex w-fit max-w-[95%] items-center gap-3 rounded-lg border border-border bg-surface px-3 py-2 text-[11px] text-ink shadow-lg" style={{ marginTop: -44 }}>
+        <span className="text-ink-2">{crop ? 'Move or resize the selection' : 'Drag to select a crop area'}</span>
+        <button type="button" onClick={cancelCrop} className="rounded-md px-2.5 py-1.5 hover:bg-surface-hover focus-visible:outline-2 focus-visible:outline-accent" aria-label="Cancel crop">Cancel <kbd className="ml-1 text-[10px] text-ink-3">Esc</kbd></button>
+        <button type="button" onClick={applyCrop} disabled={!crop || crop.width < MIN_CROP_SIZE || crop.height < MIN_CROP_SIZE} className="rounded-md bg-accent px-3 py-1.5 font-medium text-white disabled:opacity-40 hover:enabled:opacity-90 focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2" aria-label="Apply crop">Apply crop <kbd className="ml-1 text-[10px] opacity-75">Enter</kbd></button>
+      </div>}
+      {!textEditor && ['highlight', 'pen', 'arrow', 'rectangle', 'ellipse', 'text', 'number'].includes(tool) && <div className="sticky bottom-3 mx-auto w-fit max-w-[90%] pointer-events-none rounded-md bg-surface/90 px-3 py-1.5 text-[10px] text-ink-2 shadow-sm" style={{ marginTop: -30 }}>{tool === 'number' ? `Click to place step ${nextStepNumber} · Esc to select and move` : tool === 'highlight' ? textStyle?.highlightMode === 'freehand' ? 'Draw a marker stroke. Shift for a straight stroke.' : 'Drag across text to match its height. Alt for freehand.' : tool === 'pen' ? 'Draw freely · Shift for a straight stroke · Esc to cancel' : tool === 'arrow' ? 'Drag to draw · Drag the middle dot to curve · Shift for 45°' : tool === 'rectangle' || tool === 'ellipse' ? 'Drag to draw · Shift for square · Alt from center · Esc to cancel' : 'Click to type · Drag a corner to resize · Esc to finish'}</div>}
     </div>
   );
 }
